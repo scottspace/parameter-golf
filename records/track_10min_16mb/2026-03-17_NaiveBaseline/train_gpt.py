@@ -83,6 +83,13 @@ class Hyperparameters:
     # Useful for fast sweeps where only train loss matters.
     skip_final_eval = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
 
+    # Factorized attention: replace dense k/v/proj with pure low-rank UV.
+    # q stays dense. Each projection gets its own rank.
+    use_factor_attn = bool(int(os.environ.get("USE_FACTOR_ATTN", "0")))
+    attn_k_rank = int(os.environ.get("ATTN_K_RANK", "32"))
+    attn_v_rank = int(os.environ.get("ATTN_V_RANK", "32"))
+    attn_proj_rank = int(os.environ.get("ATTN_PROJ_RANK", "32"))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -526,7 +533,7 @@ class CastedLinear(nn.Linear):
         return F.linear(x, self.weight.to(x.dtype), bias)
 
 
-class FactorizedResidualLinear(nn.Module):
+class LowRankLinear(nn.Module):
     """Linear layer parameterized as W_eff = U @ V + R (no stored dense base weight).
 
     U: (out_features, rank)
@@ -643,6 +650,10 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        use_factor_attn: bool = False,
+        attn_k_rank: int = 32,
+        attn_v_rank: int = 32,
+        attn_proj_rank: int = 32,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -656,10 +667,16 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
-        self.c_k = CastedLinear(dim, kv_dim, bias=False)
-        self.c_v = CastedLinear(dim, kv_dim, bias=False)
-        self.proj = CastedLinear(dim, dim, bias=False)
-        self.proj._zero_init = True
+        if use_factor_attn:
+            self.c_k = LowRankLinear(dim, kv_dim, attn_k_rank, "none")
+            self.c_v = LowRankLinear(dim, kv_dim, attn_v_rank, "none")
+            self.proj = LowRankLinear(dim, dim, attn_proj_rank, "none")
+            nn.init.zeros_(self.proj.U)
+        else:
+            self.c_k = CastedLinear(dim, kv_dim, bias=False)
+            self.c_v = CastedLinear(dim, kv_dim, bias=False)
+            self.proj = CastedLinear(dim, dim, bias=False)
+            self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
@@ -688,7 +705,7 @@ class CausalSelfAttention(nn.Module):
 
 def _mlp_linear(in_f: int, out_f: int, rank: int, residual_mode: str, use_factor: bool, residual_rank: int = 8) -> nn.Module:
     if use_factor:
-        return FactorizedResidualLinear(in_f, out_f, rank, residual_mode, residual_rank=residual_rank)
+        return LowRankLinear(in_f, out_f, rank, residual_mode, residual_rank=residual_rank)
     return CastedLinear(in_f, out_f, bias=False)
 
 
@@ -702,7 +719,7 @@ class MLP(nn.Module):
         self.proj = _mlp_linear(hidden, dim, rank, residual_mode, use_factor, residual_rank=residual_rank)
         if isinstance(self.proj, CastedLinear):
             self.proj._zero_init = True
-        elif isinstance(self.proj, FactorizedResidualLinear):
+        elif isinstance(self.proj, LowRankLinear):
             # Match baseline: down projection starts at zero so residual stream
             # is undisturbed at init. Zero out U so U @ V = 0, R is already 0.
             nn.init.zeros_(self.proj.U)
@@ -725,11 +742,17 @@ class Block(nn.Module):
         mlp_low_rank_r: int = 32,
         mlp_residual_mode: str = "dense",
         mlp_residual_rank: int = 8,
+        use_factor_attn: bool = False,
+        attn_k_rank: int = 32,
+        attn_v_rank: int = 32,
+        attn_proj_rank: int = 32,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        use_factor_attn=use_factor_attn, attn_k_rank=attn_k_rank,
+                                        attn_v_rank=attn_v_rank, attn_proj_rank=attn_proj_rank)
         self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r,
                        residual_mode=mlp_residual_mode, residual_rank=mlp_residual_rank)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -763,6 +786,10 @@ class GPT(nn.Module):
         mlp_low_rank_r: int = 32,
         mlp_residual_mode: str = "dense",
         mlp_residual_rank: int = 8,
+        use_factor_attn: bool = False,
+        attn_k_rank: int = 32,
+        attn_v_rank: int = 32,
+        attn_proj_rank: int = 32,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -788,6 +815,10 @@ class GPT(nn.Module):
                     mlp_low_rank_r=mlp_low_rank_r,
                     mlp_residual_mode=mlp_residual_mode,
                     mlp_residual_rank=mlp_residual_rank,
+                    use_factor_attn=use_factor_attn,
+                    attn_k_rank=attn_k_rank,
+                    attn_v_rank=attn_v_rank,
+                    attn_proj_rank=attn_proj_rank,
                 )
                 for i in range(num_layers)
             ]
@@ -947,9 +978,13 @@ def main() -> None:
         mlp_low_rank_r=args.mlp_low_rank_r,
         mlp_residual_mode=args.mlp_residual_mode,
         mlp_residual_rank=args.mlp_residual_rank,
+        use_factor_attn=args.use_factor_attn,
+        attn_k_rank=args.attn_k_rank,
+        attn_v_rank=args.attn_v_rank,
+        attn_proj_rank=args.attn_proj_rank,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, (CastedLinear, FactorizedResidualLinear)):
+        if isinstance(module, (CastedLinear, LowRankLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
 
@@ -971,6 +1006,14 @@ def main() -> None:
         log0(f"factorized_mlp: total_mlp_params: dense_equiv={total_dense} factorized={total_fact}")
     else:
         log0("factorized_mlp:disabled")
+    if args.use_factor_attn:
+        sample_attn = base_model.blocks[0].attn
+        for name, layer in [("c_k", sample_attn.c_k), ("c_v", sample_attn.c_v), ("proj", sample_attn.proj)]:
+            s = layer.param_count_summary()
+            log0(f"factorized_attn: {name}: dense={s['dense']} uv={s['uv']}")
+        log0(f"factorized_attn:enabled k_rank={args.attn_k_rank} v_rank={args.attn_v_rank} proj_rank={args.attn_proj_rank}")
+    else:
+        log0("factorized_attn:disabled")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
