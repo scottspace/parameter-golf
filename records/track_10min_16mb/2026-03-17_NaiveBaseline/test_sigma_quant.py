@@ -116,6 +116,26 @@ def test_synthetic_roundtrip():
     )
     print(f"\n  sigma vs int8: {sigma_size / max(int8_size, 1):.2%} of int8 size")
 
+    # Metadata breakdown for sigma
+    print(f"\n  Sigma metadata breakdown:")
+    total_nibble_bytes = sum(v.nbytes for v in sigma_obj["level_data"].values())
+    total_mean_bytes = sum(v.nbytes for v in sigma_obj["row_means"].values())
+    total_std_bytes = sum(v.nbytes for v in sigma_obj["row_stds"].values())
+    total_outlier_idx = sum(v.nbytes for v in sigma_obj["outlier_indices"].values())
+    total_outlier_val = sum(v.nbytes for v in sigma_obj["outlier_values"].values())
+    total_passthrough = sum(v.nbytes for v in sigma_obj["passthrough"].values())
+    meta_bytes = total_mean_bytes + total_std_bytes
+    data_bytes = total_nibble_bytes + total_outlier_idx + total_outlier_val
+    print(f"    Nibble-packed levels: {total_nibble_bytes:>10,} bytes  (weight data, 4 bits/param)")
+    print(f"    Row means (fp16):     {total_mean_bytes:>10,} bytes")
+    print(f"    Row stds (fp16):      {total_std_bytes:>10,} bytes")
+    print(f"    Outlier indices:      {total_outlier_idx:>10,} bytes")
+    print(f"    Outlier values:       {total_outlier_val:>10,} bytes")
+    print(f"    Passthrough:          {total_passthrough:>10,} bytes")
+    print(f"    ---")
+    print(f"    Data total:           {data_bytes:>10,} bytes")
+    print(f"    Metadata total:       {meta_bytes:>10,} bytes  ({100*meta_bytes/max(data_bytes+meta_bytes,1):.1f}% of uncompressed)")
+
     # Per-tensor error
     print(f"\n  {'Tensor':<45} {'int8 MSE':>12} {'sigma MSE':>12} {'sigma MaxErr':>12}")
     print(f"  {'-'*83}")

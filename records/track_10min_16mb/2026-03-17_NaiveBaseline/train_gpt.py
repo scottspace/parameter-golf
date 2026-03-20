@@ -70,14 +70,9 @@ class Hyperparameters:
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
-    # Factorized MLP: replace dense MLP weights with U @ V + R.
+    # Factorized MLP: replace dense MLP weights with pure low-rank W = U @ V.
     use_factor_mlp = bool(int(os.environ.get("USE_FACTOR_MLP", "0")))
     mlp_low_rank_r = int(os.environ.get("MLP_LOW_RANK_R", "32"))
-    # "dense" is a correctness/debug path only — full dense residual to validate
-    # training stability. NOT the intended compression-efficient final design.
-    # Future modes (e.g. "sparse", "low_rank") will replace this for competition use.
-    mlp_residual_mode = os.environ.get("MLP_RESIDUAL_MODE", "dense")
-    mlp_residual_rank = int(os.environ.get("MLP_RESIDUAL_RANK", "8"))
 
     # When True, skip final validation, serialization, and int8 roundtrip eval.
     # Useful for fast sweeps where only train loss matters.
@@ -690,73 +685,30 @@ class CastedLinear(nn.Linear):
 
 
 class LowRankLinear(nn.Module):
-    """Linear layer parameterized as W_eff = U @ V + R (no stored dense base weight).
+    """Linear layer parameterized as W = U @ V (pure low-rank, no residual).
 
     U: (out_features, rank)
     V: (rank, in_features)
-    R: residual term, mode controlled by MLP_RESIDUAL_MODE
-
-    The module is structured so R's implementation can be swapped (e.g. to a
-    compressed form) without changing call sites — only _make_residual and
-    _residual_forward need to change.
     """
 
-    def __init__(self, in_features: int, out_features: int, rank: int,
-                 residual_mode: str = "dense", residual_rank: int = 8):
+    def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
-        self.residual_mode = residual_mode
-        self.residual_rank = residual_rank
 
-        # Low-rank factors: Kaiming-uniform scaled so U @ V has variance ~1/in_features,
-        # matching nn.Linear default init scale.
+        # Scaled so U @ V has variance ~1/in_features, matching nn.Linear default.
         std = (1.0 / in_features) ** 0.5
         self.U = nn.Parameter(torch.randn(out_features, rank) * (std ** 0.5))
         self.V = nn.Parameter(torch.randn(rank, in_features) * (std ** 0.5))
 
-        self._make_residual()
-
-    def _make_residual(self) -> None:
-        """Create the residual parameter(s). Override this for compressed modes."""
-        if self.residual_mode == "none":
-            pass  # Pure low-rank: W = U @ V, no residual.
-        elif self.residual_mode == "dense":
-            # TODO: replace with compressed residual for competition use.
-            self.R = nn.Parameter(torch.zeros(self.out_features, self.in_features))
-        elif self.residual_mode == "low_rank":
-            # Low-rank residual: R = A @ B, much smaller than a full dense matrix.
-            self.R_A = nn.Parameter(torch.zeros(self.out_features, self.residual_rank))
-            self.R_B = nn.Parameter(torch.zeros(self.residual_rank, self.in_features))
-        else:
-            raise ValueError(f"Unknown MLP_RESIDUAL_MODE: {self.residual_mode!r}")
-
-    def _effective_weight(self) -> Tensor:
-        """Compute W_eff = U @ V (+ R if enabled)."""
-        W = self.U @ self.V
-        if self.residual_mode == "dense":
-            W = W + self.R
-        elif self.residual_mode == "low_rank":
-            W = W + self.R_A @ self.R_B
-        return W
-
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, self._effective_weight().to(x.dtype))
+        return F.linear(x, (self.U @ self.V).to(x.dtype))
 
     def param_count_summary(self) -> dict[str, int]:
-        """Return parameter counts for logging."""
         uv = self.U.numel() + self.V.numel()
-        if self.residual_mode == "none":
-            r = 0
-        elif self.residual_mode == "dense":
-            r = self.R.numel()
-        elif self.residual_mode == "low_rank":
-            r = self.R_A.numel() + self.R_B.numel()
-        else:
-            r = 0
         dense_equiv = self.out_features * self.in_features
-        return {"dense": dense_equiv, "uv": uv, "uv_plus_residual": uv + r}
+        return {"dense": dense_equiv, "uv": uv}
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -824,9 +776,9 @@ class CausalSelfAttention(nn.Module):
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         if use_factor_attn:
-            self.c_k = LowRankLinear(dim, kv_dim, attn_k_rank, "none")
-            self.c_v = LowRankLinear(dim, kv_dim, attn_v_rank, "none")
-            self.proj = LowRankLinear(dim, dim, attn_proj_rank, "none")
+            self.c_k = LowRankLinear(dim, kv_dim, attn_k_rank)
+            self.c_v = LowRankLinear(dim, kv_dim, attn_v_rank)
+            self.proj = LowRankLinear(dim, dim, attn_proj_rank)
             nn.init.zeros_(self.proj.U)
         else:
             self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -859,25 +811,23 @@ class CausalSelfAttention(nn.Module):
         return self.proj(y)
 
 
-def _mlp_linear(in_f: int, out_f: int, rank: int, residual_mode: str, use_factor: bool, residual_rank: int = 8) -> nn.Module:
+def _mlp_linear(in_f: int, out_f: int, rank: int, use_factor: bool) -> nn.Module:
     if use_factor:
-        return LowRankLinear(in_f, out_f, rank, residual_mode, residual_rank=residual_rank)
+        return LowRankLinear(in_f, out_f, rank)
     return CastedLinear(in_f, out_f, bias=False)
 
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, use_factor: bool = False, rank: int = 32,
-                 residual_mode: str = "dense", residual_rank: int = 8):
+    def __init__(self, dim: int, mlp_mult: int, use_factor: bool = False, rank: int = 32):
         super().__init__()
         hidden = mlp_mult * dim
-        self.fc = _mlp_linear(dim, hidden, rank, residual_mode, use_factor, residual_rank=residual_rank)
-        self.proj = _mlp_linear(hidden, dim, rank, residual_mode, use_factor, residual_rank=residual_rank)
+        self.fc = _mlp_linear(dim, hidden, rank, use_factor)
+        self.proj = _mlp_linear(hidden, dim, rank, use_factor)
         if isinstance(self.proj, CastedLinear):
             self.proj._zero_init = True
         elif isinstance(self.proj, LowRankLinear):
-            # Match baseline: down projection starts at zero so residual stream
-            # is undisturbed at init. Zero out U so U @ V = 0, R is already 0.
+            # Match baseline: down projection starts at zero so U @ V = 0.
             nn.init.zeros_(self.proj.U)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -896,8 +846,6 @@ class Block(nn.Module):
         qk_gain_init: float,
         use_factor_mlp: bool = False,
         mlp_low_rank_r: int = 32,
-        mlp_residual_mode: str = "dense",
-        mlp_residual_rank: int = 8,
         use_factor_attn: bool = False,
         attn_k_rank: int = 32,
         attn_v_rank: int = 32,
@@ -909,8 +857,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         use_factor_attn=use_factor_attn, attn_k_rank=attn_k_rank,
                                         attn_v_rank=attn_v_rank, attn_proj_rank=attn_proj_rank)
-        self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r,
-                       residual_mode=mlp_residual_mode, residual_rank=mlp_residual_rank)
+        self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -940,8 +887,6 @@ class GPT(nn.Module):
         qk_gain_init: float,
         use_factor_mlp: bool = False,
         mlp_low_rank_r: int = 32,
-        mlp_residual_mode: str = "dense",
-        mlp_residual_rank: int = 8,
         use_factor_attn: bool = False,
         attn_k_rank: int = 32,
         attn_v_rank: int = 32,
@@ -969,8 +914,6 @@ class GPT(nn.Module):
                     qk_gain_init,
                     use_factor_mlp=use_factor_mlp,
                     mlp_low_rank_r=mlp_low_rank_r,
-                    mlp_residual_mode=mlp_residual_mode,
-                    mlp_residual_rank=mlp_residual_rank,
                     use_factor_attn=use_factor_attn,
                     attn_k_rank=attn_k_rank,
                     attn_v_rank=attn_v_rank,
@@ -1132,8 +1075,6 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         use_factor_mlp=args.use_factor_mlp,
         mlp_low_rank_r=args.mlp_low_rank_r,
-        mlp_residual_mode=args.mlp_residual_mode,
-        mlp_residual_rank=args.mlp_residual_rank,
         use_factor_attn=args.use_factor_attn,
         attn_k_rank=args.attn_k_rank,
         attn_v_rank=args.attn_v_rank,
@@ -1148,17 +1089,11 @@ def main() -> None:
     if args.use_factor_mlp:
         sample_mlp = base_model.blocks[0].mlp
         s = sample_mlp.fc.param_count_summary()
-        log0(
-            f"factorized_mlp:enabled rank={args.mlp_low_rank_r} residual_mode={args.mlp_residual_mode} "
-            f"residual_rank={args.mlp_residual_rank} "
-            f"per_layer(fc): dense={s['dense']} uv={s['uv']} uv+R={s['uv_plus_residual']}"
-        )
+        log0(f"factorized_mlp:enabled rank={args.mlp_low_rank_r} per_layer(fc): dense={s['dense']} uv={s['uv']}")
         s2 = sample_mlp.proj.param_count_summary()
-        log0(
-            f"factorized_mlp: per_layer(proj): dense={s2['dense']} uv={s2['uv']} uv+R={s2['uv_plus_residual']}"
-        )
+        log0(f"factorized_mlp: per_layer(proj): dense={s2['dense']} uv={s2['uv']}")
         total_dense = (s["dense"] + s2["dense"]) * args.num_layers
-        total_fact = (s["uv_plus_residual"] + s2["uv_plus_residual"]) * args.num_layers
+        total_fact = (s["uv"] + s2["uv"]) * args.num_layers
         log0(f"factorized_mlp: total_mlp_params: dense_equiv={total_dense} factorized={total_fact}")
     else:
         log0("factorized_mlp:disabled")
