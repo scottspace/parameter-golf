@@ -12,3 +12,4 @@
 {"run_id":"sweep_none_r16","rank":16,"train_loss":4.1607,"params":8065096,"step_avg_ms":null,"elapsed_s":304}
 {"run_id":"sweep_none_r32","rank":32,"train_loss":4.0368,"params":8507464,"step_avg_ms":null,"elapsed_s":308}
 {"run_id":"sweep_none_r64","rank":64,"train_loss":3.8717,"params":9392200,"step_avg_ms":null,"elapsed_s":311}
+{"run_id":"test_sigma","rank":32,"train_loss":4.0549,"params":8507464,"step_avg_ms":601.10,"elapsed_s":2204}

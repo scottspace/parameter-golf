@@ -1,0 +1,5 @@
+{"run_id":"depth_L9_r64_kv16_proj32","layers":9,"train_loss":null,"params":5189704,"step_avg_ms":null,"elapsed_s":310}
+{"run_id":"depth_L12_r64_kv16_proj32","layers":12,"train_loss":null,"params":6745184,"step_avg_ms":null,"elapsed_s":413}
+{"run_id":"depth_L15_r64_kv16_proj32","layers":15,"train_loss":null,"params":8300152,"step_avg_ms":null,"elapsed_s":516}
+{"run_id":"depth_L18_r64_kv16_proj32","layers":18,"train_loss":null,"params":9855632,"step_avg_ms":null,"elapsed_s":1078}
+{"run_id":"depth_L22_r64_kv16_proj32","layers":22,"train_loss":null,"params":11929264,"step_avg_ms":null,"elapsed_s":763}
