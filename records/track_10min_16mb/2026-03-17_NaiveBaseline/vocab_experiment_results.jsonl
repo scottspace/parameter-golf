@@ -1,0 +1,2 @@
+{"run_id":"vocab_1024_baseline","vocab":1024,"train_loss":3.9129,"params":5189704}
+{"run_id":"vocab_2048_transcode","vocab":2048,"train_loss":4.6441,"params":5713992}

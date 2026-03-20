@@ -1,0 +1,10 @@
+{"run_id":"sweep_attn_baseline","k_rank":"dense","v_rank":"dense","proj_rank":"dense","train_loss":3.8677,"params":9392200,"elapsed_s":0}
+{"run_id":"sweep_attn_tied_r16","k_rank":16,"v_rank":16,"proj_rank":16,"train_loss":3.9947,"params":5042248,"elapsed_s":305}
+{"run_id":"sweep_attn_tied_r32","k_rank":32,"v_rank":32,"proj_rank":32,"train_loss":3.9274,"params":5410888,"elapsed_s":302}
+{"run_id":"sweep_attn_tied_r64","k_rank":64,"v_rank":64,"proj_rank":64,"train_loss":4.0085,"params":6148168,"elapsed_s":669}
+{"run_id":"sweep_attn_proj_r16","k_rank":32,"v_rank":32,"proj_rank":16,"train_loss":3.9358,"params":5263432,"elapsed_s":318}
+{"run_id":"sweep_attn_proj_r32","k_rank":32,"v_rank":32,"proj_rank":32,"train_loss":3.9262,"params":5410888,"elapsed_s":304}
+{"run_id":"sweep_attn_proj_r64","k_rank":32,"v_rank":32,"proj_rank":64,"train_loss":3.9477,"params":5705800,"elapsed_s":319}
+{"run_id":"sweep_attn_kv_r16","k_rank":16,"v_rank":16,"proj_rank":32,"train_loss":3.9093,"params":5189704,"elapsed_s":304}
+{"run_id":"sweep_attn_kv_r32","k_rank":32,"v_rank":32,"proj_rank":32,"train_loss":3.9548,"params":5410888,"elapsed_s":304}
+{"run_id":"sweep_attn_kv_r64","k_rank":64,"v_rank":64,"proj_rank":32,"train_loss":4.0312,"params":5853256,"elapsed_s":303}

@@ -97,6 +97,12 @@ class Hyperparameters:
     attn_v_rank: int = int(os.environ.get("ATTN_V_RANK", "32"))
     attn_proj_rank: int = int(os.environ.get("ATTN_PROJ_RANK", "32"))
 
+    # Transcoding: stream from a source tokenizer's shards, decode on the fly,
+    # and re-encode with the target tokenizer. Avoids storing retokenized data.
+    # Set TRANSCODE_SOURCE_TOKENIZER to the .model path of the source tokenizer
+    # and DATA_PATH to the source shard directory. TOKENIZER_PATH is the target.
+    transcode_source_tokenizer: str = os.environ.get("TRANSCODE_SOURCE_TOKENIZER", "")
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -284,6 +290,50 @@ class TokenLoader:
         if usable <= 0:
             raise ValueError(f"token budget too small for seq_len={seq_len}")
         chunk = self.stream.take(usable + 1)
+        x = chunk[:-1].reshape(-1, seq_len)
+        y = chunk[1:].reshape(-1, seq_len)
+        return mx.array(x, dtype=mx.int32), mx.array(y, dtype=mx.int32)
+
+
+class TranscodingTokenLoader:
+    """Stream from source-tokenizer shards, decode, re-encode with target tokenizer.
+
+    Produces the same (x, y) batches as TokenLoader but without pre-tokenized
+    target shards on disk. Keeps a buffer of re-encoded tokens and refills it
+    by decoding chunks from the source stream.
+    """
+
+    def __init__(
+        self,
+        pattern: str,
+        source_sp: spm.SentencePieceProcessor,
+        target_sp: spm.SentencePieceProcessor,
+        log_fn: Callable[[str], None] | None = None,
+        dataset_name: str = "",
+        decode_chunk_size: int = 200_000,
+    ):
+        self.source_stream = TokenStream(pattern, log_fn=log_fn, dataset_name=dataset_name)
+        self.source_sp = source_sp
+        self.target_sp = target_sp
+        self.decode_chunk_size = decode_chunk_size
+        self._buf: np.ndarray = np.array([], dtype=np.int32)
+
+    def _refill(self, min_tokens: int) -> None:
+        """Decode source tokens and re-encode until buffer has enough."""
+        while self._buf.size < min_tokens:
+            src_chunk = self.source_stream.take(self.decode_chunk_size)
+            text = self.source_sp.decode(src_chunk.tolist())
+            new_ids = self.target_sp.encode(text)
+            self._buf = np.concatenate([self._buf, np.array(new_ids, dtype=np.int32)])
+
+    def next_batch(self, batch_tokens: int, seq_len: int) -> tuple[mx.array, mx.array]:
+        usable = (batch_tokens // seq_len) * seq_len
+        if usable <= 0:
+            raise ValueError(f"token budget too small for seq_len={seq_len}")
+        need = usable + 1
+        self._refill(need)
+        chunk = self._buf[:need]
+        self._buf = self._buf[need:]
         x = chunk[:-1].reshape(-1, seq_len)
         y = chunk[1:].reshape(-1, seq_len)
         return mx.array(x, dtype=mx.int32), mx.array(y, dtype=mx.int32)
@@ -992,9 +1042,10 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
+    validate_tokenizer = args.transcode_source_tokenizer if args.transcode_source_tokenizer else args.tokenizer_path
     dataset_name, actual_train_files, expected_train_files = validate_dataset_tokenizer_pair(
         args.data_path,
-        args.tokenizer_path,
+        validate_tokenizer,
     )
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
 
@@ -1007,7 +1058,14 @@ def main() -> None:
     # ==============================================================================
     mx.random.seed(args.seed)
 
-    train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+    if args.transcode_source_tokenizer:
+        source_sp = spm.SentencePieceProcessor(model_file=args.transcode_source_tokenizer)
+        log(f"transcoding:enabled source={args.transcode_source_tokenizer} target={args.tokenizer_path}")
+        train_loader = TranscodingTokenLoader(
+            args.train_files, source_sp, sp, log_fn=log, dataset_name=dataset_name,
+        )
+    else:
+        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
     # ==============================================================================
     # MODEL + OPTIMIZER SETUP
@@ -1156,7 +1214,12 @@ def main() -> None:
         mx.eval(warm_val_loss)
         mx.synchronize()
 
-        train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
+        if args.transcode_source_tokenizer:
+            train_loader = TranscodingTokenLoader(
+                args.train_files, source_sp, sp, log_fn=log, dataset_name=dataset_name,
+            )
+        else:
+            train_loader = TokenLoader(args.train_files, log_fn=log, dataset_name=dataset_name)
 
     train_time_ms = 0.0
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
