@@ -86,6 +86,10 @@ class Hyperparameters:
     mlp_residual_mode: str = os.environ.get("MLP_RESIDUAL_MODE", "dense")
     mlp_residual_rank: int = int(os.environ.get("MLP_RESIDUAL_RANK", "8"))
 
+    # When True, skip final validation, serialization, and int8 roundtrip eval.
+    # Useful for fast sweeps where only train loss matters.
+    skip_final_eval: bool = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
+
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
     beta2: float = float(os.environ.get("BETA2", 0.95))
@@ -322,7 +326,9 @@ class FactorizedResidualLinear(nn.Module):
 
     def _make_residual(self) -> None:
         """Create the residual parameter(s). Override this for compressed modes."""
-        if self.residual_mode == "dense":
+        if self.residual_mode == "none":
+            pass  # Pure low-rank: W = U @ V, no residual.
+        elif self.residual_mode == "dense":
             # TODO: replace with compressed residual for competition use.
             self.R = mx.zeros((self.out_features, self.in_features))
         elif self.residual_mode == "low_rank":
@@ -333,7 +339,7 @@ class FactorizedResidualLinear(nn.Module):
             raise ValueError(f"Unknown MLP_RESIDUAL_MODE: {self.residual_mode!r}")
 
     def _effective_weight(self) -> mx.array:
-        """Compute W_eff = U @ V + R."""
+        """Compute W_eff = U @ V (+ R if enabled)."""
         W = self.U @ self.V
         if self.residual_mode == "dense":
             W = W + self.R
@@ -347,7 +353,9 @@ class FactorizedResidualLinear(nn.Module):
     def param_count_summary(self) -> dict[str, int]:
         """Return parameter counts for logging."""
         uv = self.U.size + self.V.size
-        if self.residual_mode == "dense":
+        if self.residual_mode == "none":
+            r = 0
+        elif self.residual_mode == "dense":
             r = self.R.size
         elif self.residual_mode == "low_rank":
             r = self.R_A.size + self.R_B.size
@@ -1115,7 +1123,8 @@ def main() -> None:
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        should_validate = (last_step and not args.skip_final_eval) or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        if should_validate:
             train_time_ms += 1000.0 * (time.perf_counter() - t0)
             # Validation always scans the same fixed full validation split.
             val_loss, val_bpb = eval_val(
@@ -1173,42 +1182,46 @@ def main() -> None:
     # We always write a raw artifact and a quantized artifact, then validate the
     # quantized roundtrip directly by loading the dequantized tensors back into the
     # model and running one final validation pass.
-    out_path = out_dir / f"{args.run_id}_mlx_model.npz"
-    flat_state = {k: v for k, v in tree_flatten(model.state)}
-    mx.savez(str(out_path), **flat_state)
-    log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
+    # Skip serialization and roundtrip eval when validation is disabled (sweep mode).
+    if not args.skip_final_eval:
+        out_path = out_dir / f"{args.run_id}_mlx_model.npz"
+        flat_state = {k: v for k, v in tree_flatten(model.state)}
+        mx.savez(str(out_path), **flat_state)
+        log(f"saved_model:{out_path} bytes:{out_path.stat().st_size}")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
-    quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_serialized_bytes = len(quant_raw)
-    quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
-    with quant_path.open("wb") as f:
-        f.write(quant_blob)
-    quant_file_bytes = quant_path.stat().st_size
-    ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-    log(
-        f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
-        f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
-    )
+        quant_obj, quant_stats = quantize_state_dict_int8(flat_state)
+        quant_raw = pickle.dumps(quant_obj, protocol=pickle.HIGHEST_PROTOCOL)
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_serialized_bytes = len(quant_raw)
+        quant_path = out_dir / f"{args.run_id}_mlx_model.int8.ptz"
+        with quant_path.open("wb") as f:
+            f.write(quant_blob)
+        quant_file_bytes = quant_path.stat().st_size
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+        log(
+            f"serialized_model_int8_zlib:{quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_pickle:{quant_serialized_bytes} payload_ratio:{ratio:.2f}x)"
+        )
 
-    with quant_path.open("rb") as f:
-        quant_blob_disk = f.read()
-    quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
-    model.update(tree_unflatten(list(quant_flat.items())))
-    q_t0 = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        compiled_loss,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-        log_fn=log,
-    )
-    q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
-    log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
-    log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        with quant_path.open("rb") as f:
+            quant_blob_disk = f.read()
+        quant_flat = dequantize_state_dict_int8(pickle.loads(zlib.decompress(quant_blob_disk)))
+        model.update(tree_unflatten(list(quant_flat.items())))
+        q_t0 = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            compiled_loss,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            log_fn=log,
+        )
+        q_eval_ms = 1000.0 * (time.perf_counter() - q_t0)
+        log(f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} eval_time:{q_eval_ms:.0f}ms")
+        log(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    else:
+        log("skip_final_eval=1: skipping serialization and roundtrip eval")
 
 
 if __name__ == "__main__":

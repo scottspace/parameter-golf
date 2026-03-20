@@ -79,6 +79,10 @@ class Hyperparameters:
     mlp_residual_mode = os.environ.get("MLP_RESIDUAL_MODE", "dense")
     mlp_residual_rank = int(os.environ.get("MLP_RESIDUAL_RANK", "8"))
 
+    # When True, skip final validation, serialization, and int8 roundtrip eval.
+    # Useful for fast sweeps where only train loss matters.
+    skip_final_eval = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
+
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
@@ -553,7 +557,9 @@ class FactorizedResidualLinear(nn.Module):
 
     def _make_residual(self) -> None:
         """Create the residual parameter(s). Override this for compressed modes."""
-        if self.residual_mode == "dense":
+        if self.residual_mode == "none":
+            pass  # Pure low-rank: W = U @ V, no residual.
+        elif self.residual_mode == "dense":
             # TODO: replace with compressed residual for competition use.
             self.R = nn.Parameter(torch.zeros(self.out_features, self.in_features))
         elif self.residual_mode == "low_rank":
@@ -564,7 +570,7 @@ class FactorizedResidualLinear(nn.Module):
             raise ValueError(f"Unknown MLP_RESIDUAL_MODE: {self.residual_mode!r}")
 
     def _effective_weight(self) -> Tensor:
-        """Compute W_eff = U @ V + R."""
+        """Compute W_eff = U @ V (+ R if enabled)."""
         W = self.U @ self.V
         if self.residual_mode == "dense":
             W = W + self.R
@@ -578,7 +584,9 @@ class FactorizedResidualLinear(nn.Module):
     def param_count_summary(self) -> dict[str, int]:
         """Return parameter counts for logging."""
         uv = self.U.numel() + self.V.numel()
-        if self.residual_mode == "dense":
+        if self.residual_mode == "none":
+            r = 0
+        elif self.residual_mode == "dense":
             r = self.R.numel()
         elif self.residual_mode == "low_rank":
             r = self.R_A.numel() + self.R_B.numel()
@@ -1096,7 +1104,7 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        should_validate = (last_step and not args.skip_final_eval) or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
         if should_validate:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
@@ -1187,59 +1195,63 @@ def main() -> None:
     # -----------------------------
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
+    # Skip when SKIP_FINAL_EVAL=1 (fast sweep mode).
 
-    if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
-        model_bytes = os.path.getsize("final_model.pt")
-        code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model: {model_bytes} bytes")
-        log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+    if not args.skip_final_eval:
+        if master_process:
+            torch.save(base_model.state_dict(), "final_model.pt")
+            model_bytes = os.path.getsize("final_model.pt")
+            code_bytes = len(code.encode("utf-8"))
+            log0(f"Serialized model: {model_bytes} bytes")
+            log0(f"Code size: {code_bytes} bytes")
+            log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open("final_model.int8.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        q_val_loss, q_val_bpb = eval_val(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
         )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
-
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        torch.cuda.synchronize()
+        log0(
+            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        )
+        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    else:
+        log0("skip_final_eval=1: skipping serialization and roundtrip eval")
 
     if distributed:
         dist.destroy_process_group()
