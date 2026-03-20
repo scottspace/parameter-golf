@@ -82,6 +82,7 @@ class Hyperparameters:
     # When True, skip final validation, serialization, and int8 roundtrip eval.
     # Useful for fast sweeps where only train loss matters.
     skip_final_eval = bool(int(os.environ.get("SKIP_FINAL_EVAL", "0")))
+    quant_mode = os.environ.get("QUANT_MODE", "int8")  # int8 or sigma
 
     # Factorized attention: replace dense k/v/proj with pure low-rank UV.
     # q stays dense. Each projection gets its own rank.
@@ -443,7 +444,162 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
 
 
 # -----------------------------
-# DATA LOADING 
+# SIGMA-BASED QUANTIZATION (3-bit 7-level bulk + int8 outliers)
+# -----------------------------
+# Per-row: normalize to zero mean / unit variance, quantize bulk (|z|<=3.5) to
+# 7 levels {-3,-2,-1,0,+1,+2,+3} packed as nibbles (2 per byte), store rare
+# outliers (|z|>3.5) as int8.  Row-level mean (fp16) + std (fp16) for recon.
+
+SIGMA_OUTLIER_BOUNDARY = 3.5   # beyond this → int8 outlier
+SIGMA_OUTLIER_RANGE = 6.0      # int8 outliers cover ±6σ
+
+def _pack_nibble(t: np.ndarray) -> np.ndarray:
+    """Pack values 0-6 as nibbles, 2 per byte."""
+    flat = t.ravel().astype(np.uint8)
+    if len(flat) % 2:
+        flat = np.concatenate([flat, np.zeros(1, dtype=np.uint8)])
+    lo = flat[0::2]
+    hi = flat[1::2]
+    return (lo | (hi << 4)).astype(np.uint8)
+
+
+def _unpack_nibble(packed: np.ndarray, n_values: int) -> np.ndarray:
+    """Unpack nibble-packed values."""
+    lo = packed & 0x0F
+    hi = (packed >> 4) & 0x0F
+    flat = np.stack([lo, hi], axis=-1).ravel()[:n_values]
+    return flat.astype(np.int8)
+
+
+def quantize_state_dict_sigma(state_dict: dict[str, Tensor]) -> tuple[dict[str, object], dict[str, int]]:
+    """Sigma-based 7-level quantization with outlier int8 storage."""
+    level_data: dict[str, np.ndarray] = {}
+    row_means: dict[str, np.ndarray] = {}
+    row_stds: dict[str, np.ndarray] = {}
+    outlier_indices: dict[str, np.ndarray] = {}
+    outlier_values: dict[str, np.ndarray] = {}
+    shapes: dict[str, tuple] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors",
+         "baseline_tensor_bytes", "sigma_payload_bytes"),
+        0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["sigma_payload_bytes"] += tensor_nbytes(t)
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["sigma_payload_bytes"] += tensor_nbytes(kept)
+            continue
+
+        stats["num_float_tensors"] += 1
+        f32 = t.float().numpy()
+        orig_shape = f32.shape
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        shapes[name] = orig_shape
+
+        if f32.ndim == 1:
+            f32_2d = f32.reshape(1, -1)
+        else:
+            f32_2d = f32.reshape(f32.shape[0], -1)
+
+        mu = f32_2d.mean(axis=1, keepdims=True)
+        std = f32_2d.std(axis=1, keepdims=True)
+        std = np.maximum(std, 1e-8)
+        z = (f32_2d - mu) / std
+
+        # 7-level quantization: round z to nearest int in {-3..+3}, store as 0-6
+        bulk_mask = np.abs(z) <= SIGMA_OUTLIER_BOUNDARY
+        q_levels = np.clip(np.round(z), -3, 3).astype(np.int8) + 3  # 0-6
+
+        # Outliers: |z| > 3.5
+        outlier_mask = ~bulk_mask
+        if outlier_mask.any():
+            out_idx = np.argwhere(outlier_mask).astype(np.uint16)
+            out_z = z[outlier_mask]
+            out_int8 = np.clip(np.round(out_z * (127.0 / SIGMA_OUTLIER_RANGE)), -127, 127).astype(np.int8)
+            outlier_indices[name] = out_idx
+            outlier_values[name] = out_int8
+            stats["sigma_payload_bytes"] += int(out_idx.nbytes + out_int8.nbytes)
+
+        packed = _pack_nibble(q_levels)
+        level_data[name] = packed
+        row_means[name] = mu.ravel().astype(np.float16)
+        row_stds[name] = std.ravel().astype(np.float16)
+        stats["sigma_payload_bytes"] += int(packed.nbytes + 4 * len(mu.ravel()))
+
+    obj: dict[str, object] = {
+        "__quant_format__": "sigma_7level_v1",
+        "level_data": level_data,
+        "row_means": row_means,
+        "row_stds": row_stds,
+        "outlier_indices": outlier_indices,
+        "outlier_values": outlier_values,
+        "shapes": shapes,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_sigma(obj: dict[str, object]) -> dict[str, Tensor]:
+    """Reconstruct weights from sigma-based 7-level quantization."""
+    out: dict[str, Tensor] = {}
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
+    outlier_indices = obj.get("outlier_indices", {})
+    outlier_values = obj.get("outlier_values", {})
+
+    for name in obj["level_data"]:
+        packed = np.asarray(obj["level_data"][name], dtype=np.uint8)
+        orig_shape = obj["shapes"][name]
+        dtype = getattr(torch, obj["dtypes"][name])
+        mu = np.asarray(obj["row_means"][name], dtype=np.float32)
+        std = np.asarray(obj["row_stds"][name], dtype=np.float32)
+
+        rows = 1 if len(orig_shape) == 1 else orig_shape[0]
+        cols = int(np.prod(orig_shape)) // rows
+
+        n_values = rows * cols
+        levels = _unpack_nibble(packed, n_values).reshape(rows, cols).astype(np.float32)
+        z_recon = levels - 3.0
+
+        w = z_recon * std.reshape(-1, 1) + mu.reshape(-1, 1)
+
+        # Apply outliers
+        if name in outlier_indices:
+            idx = np.asarray(outlier_indices[name], dtype=np.int64)
+            vals = np.asarray(outlier_values[name], dtype=np.float32)
+            z_restored = vals * (SIGMA_OUTLIER_RANGE / 127.0)
+            for k in range(len(idx)):
+                r, c = int(idx[k, 0]), int(idx[k, 1])
+                w[r, c] = z_restored[k] * std[r] + mu[r]
+
+        out[name] = torch.from_numpy(w.reshape(orig_shape)).to(dtype=dtype).contiguous()
+
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
+    return out
+
+
+# -----------------------------
+# DATA LOADING
 # -----------------------------
 
 def load_data_shard(file: Path) -> Tensor:
@@ -1249,30 +1405,38 @@ def main() -> None:
             log0(f"Code size: {code_bytes} bytes")
             log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        if args.quant_mode == "sigma":
+            quant_obj, quant_stats = quantize_state_dict_sigma(base_model.state_dict())
+            payload_key = "sigma_payload_bytes"
+            dequant_fn = dequantize_state_dict_sigma
+        else:
+            quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+            payload_key = "int8_payload_bytes"
+            dequant_fn = dequantize_state_dict_int8
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
         quant_blob = zlib.compress(quant_raw, level=9)
         quant_raw_bytes = len(quant_raw)
+        ptz_filename = f"final_model.{args.quant_mode}.ptz"
         if master_process:
-            with open("final_model.int8.ptz", "wb") as f:
+            with open(ptz_filename, "wb") as f:
                 f.write(quant_blob)
-            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            quant_file_bytes = os.path.getsize(ptz_filename)
             code_bytes = len(code.encode("utf-8"))
-            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats[payload_key], 1)
             log0(
-                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+                f"Serialized model {args.quant_mode}+zlib: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats[payload_key]} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
             )
-            log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+            log0(f"Total submission size {args.quant_mode}+zlib: {quant_file_bytes + code_bytes} bytes")
 
         if distributed:
             dist.barrier()
-        with open("final_model.int8.ptz", "rb") as f:
+        with open(ptz_filename, "rb") as f:
             quant_blob_disk = f.read()
         quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        base_model.load_state_dict(dequant_fn(quant_state), strict=True)
         torch.cuda.synchronize()
         t_qeval = time.perf_counter()
         q_val_loss, q_val_bpb = eval_val(
@@ -1289,10 +1453,10 @@ def main() -> None:
         )
         torch.cuda.synchronize()
         log0(
-            f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+            f"final_{args.quant_mode}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
             f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
         )
-        log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(f"final_{args.quant_mode}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
     else:
         log0("skip_final_eval=1: skipping serialization and roundtrip eval")
 
