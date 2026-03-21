@@ -1144,14 +1144,16 @@ def main() -> None:
 
     # Log factorized MLP config once at startup.
     if args.use_factor_mlp:
-        sample_mlp = base_model.blocks[0].mlp
+        sample_block_mlp = base_model.blocks[0].mlp
+        sample_mlp = sample_block_mlp.experts[0] if isinstance(sample_block_mlp, MoEMLP) else sample_block_mlp
         s = sample_mlp.fc.param_count_summary()
         log0(f"factorized_mlp:enabled rank={args.mlp_low_rank_r} per_layer(fc): dense={s['dense']} uv={s['uv']}")
         s2 = sample_mlp.proj.param_count_summary()
         log0(f"factorized_mlp: per_layer(proj): dense={s2['dense']} uv={s2['uv']}")
-        total_dense = (s["dense"] + s2["dense"]) * args.num_layers
-        total_fact = (s["uv"] + s2["uv"]) * args.num_layers
-        log0(f"factorized_mlp: total_mlp_params: dense_equiv={total_dense} factorized={total_fact}")
+        n_experts = args.moe_num_experts if args.use_moe else 1
+        total_dense = (s["dense"] + s2["dense"]) * args.num_layers * n_experts
+        total_fact = (s["uv"] + s2["uv"]) * args.num_layers * n_experts
+        log0(f"factorized_mlp: total_mlp_params: dense_equiv={total_dense} factorized={total_fact} experts_per_layer={n_experts}")
     else:
         log0("factorized_mlp:disabled")
     if args.use_factor_attn:
