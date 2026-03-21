@@ -22,12 +22,33 @@ def compress(data, method, level):
         return pyzstd.compress(data, level)
     return zlib.compress(data, min(level, 9))
 
+def load_config(model_path):
+    """Load config JSON saved alongside the model (same prefix, _config.json)."""
+    import json as _json
+    config_path = model_path.replace("_model.pt", "_config.json")
+    if not os.path.exists(config_path):
+        # Try legacy path: final_model.pt -> look for any *_config.json in logs/
+        d = os.path.dirname(model_path) or "."
+        candidates = [f for f in os.listdir(d) if f.endswith("_config.json")]
+        if candidates:
+            config_path = os.path.join(d, sorted(candidates)[-1])
+    if os.path.exists(config_path):
+        print(f"Loading config from {config_path}")
+        with open(config_path) as f:
+            config = _json.load(f)
+        for k, v in config.items():
+            if k.startswith("_") or k == "n_params": continue
+            os.environ.setdefault(k.upper(), str(v))
+    else:
+        print(f"WARNING: no config found, using env vars / defaults")
+
 def main():
     model_path = sys.argv[1] if len(sys.argv) > 1 else None
     run_eval = "--eval" in sys.argv
     if not model_path or model_path.startswith("--"):
         print("Usage: python sweep_compression.py <model.pt> [--eval]"); return
 
+    load_config(model_path)
     print(f"Loading {model_path}...")
     state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
     combos = []

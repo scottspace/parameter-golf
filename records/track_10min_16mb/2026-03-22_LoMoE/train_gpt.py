@@ -1160,6 +1160,16 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
+    # Save config for reproducibility (sweep, eval, etc.)
+    config = {k: v for k, v in vars(Hyperparameters).items()
+              if not k.startswith("_") and not callable(v)}
+    config["n_params"] = n_params
+    config_path = os.path.join("logs", f"{args.run_id}_config.json")
+    if master_process:
+        import json as _json
+        with open(config_path, "w") as f:
+            _json.dump(config, f, indent=2, default=str)
+        log0(f"config_saved:{config_path}")
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
