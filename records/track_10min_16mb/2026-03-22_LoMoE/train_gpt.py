@@ -750,43 +750,24 @@ class MoEMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])
+        x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
         N, D = x_flat.shape
         E = self.num_experts
 
-        logits = self.router(x_flat)
-        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)
-        top_k_weights = F.softmax(top_k_logits, dim=-1)
+        logits = self.router(x_flat)  # (N, E)
+        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)  # (N, K)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, K)
 
         # Load balancing auxiliary loss
         probs = F.softmax(logits, dim=-1)
         one_hot = F.one_hot(top_k_indices, E).sum(dim=1).float()
         self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * E
 
-        # Sort tokens by expert for contiguous grouping
-        flat_ids = top_k_indices.reshape(-1)
-        flat_w = top_k_weights.reshape(-1, 1)
-        flat_x = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
-        NK = flat_ids.shape[0]
-
-        order = flat_ids.argsort(stable=True)
-        sorted_x = flat_x[order]
-        sorted_ids = flat_ids[order]
-
-        counts = torch.zeros(E + 1, dtype=torch.long, device=x.device)
-        counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
-        offsets = counts.cumsum(0)
-        max_count = counts[1:].max().item()
-
-        # Run each expert on its contiguous token slice.
-        parts = []
-        for e in range(E):
-            s, t = offsets[e].item(), offsets[e + 1].item()
-            if s < t:
-                parts.append(self.experts[e](sorted_x[s:t]))
-        sorted_out = torch.cat(parts, dim=0) * flat_w[order]
-
-        output = sorted_out[order.argsort()].reshape(N, self.top_k, D).sum(dim=1)
+        # Compute all experts, gather top-K, blend. No sort, no .item(), no graph breaks.
+        expert_outputs = torch.stack([e(x_flat) for e in self.experts], dim=1)  # (N, E, D)
+        idx = top_k_indices.unsqueeze(-1).expand(-1, -1, D)  # (N, K, D)
+        selected = expert_outputs.gather(1, idx)  # (N, K, D)
+        output = (selected * top_k_weights.unsqueeze(-1)).sum(dim=1)  # (N, D)
         return output.reshape(orig_shape)
 
 
@@ -988,7 +969,8 @@ def main() -> None:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
     if 8 % world_size != 0:
         raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    grad_accum_override = os.environ.get("GRAD_ACCUM_STEPS")
+    grad_accum_steps = int(grad_accum_override) if grad_accum_override else 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -1121,11 +1103,7 @@ def main() -> None:
         log0(f"factorized_attn:enabled k_rank={args.attn_k_rank} v_rank={args.attn_v_rank} proj_rank={args.attn_proj_rank}")
     else:
         log0("factorized_attn:disabled")
-    if args.use_moe:
-        torch._dynamo.config.capture_scalar_outputs = True
-        compiled_model = torch.compile(base_model, dynamic=True)
-    else:
-        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
