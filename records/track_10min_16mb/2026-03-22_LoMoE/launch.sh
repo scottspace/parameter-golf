@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
-if [ "$1" = "kill" ]; then
-    pkill -f "train_gpt.py" && echo "Killed." || echo "Nothing running."
-    exit 0
-fi
+DIR=$(cd "$(dirname "$0")" && pwd)
 
-RUN_ID=${1:-lomoe_v1}
-LOGFILE=/workspace/parameter-golf/logs/${RUN_ID}.out
-
-nohup bash /workspace/parameter-golf/records/track_10min_16mb/2026-03-22_LoMoE/run.sh "$RUN_ID" > "$LOGFILE" 2>&1 &
-echo "PID: $! — logging to $LOGFILE"
-echo "tail -f $LOGFILE"
+case "${1:-run}" in
+    kill) pkill -f "train_gpt.py" && echo "Killed." || echo "Nothing running." ;;
+    log)  tail -f /workspace/parameter-golf/logs/lomoe.out ;;
+    *)
+        nohup bash "$DIR/run.sh" lomoe > /workspace/parameter-golf/logs/lomoe.out 2>&1 &
+        echo "PID: $! — bash launch.sh log to watch"
+        ;;
+esac
