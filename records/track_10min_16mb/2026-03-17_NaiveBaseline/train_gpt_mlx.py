@@ -561,7 +561,9 @@ class GPT(nn.Module):
             if use_ortho_init:
                 # Orthogonal init for all 2D weight matrices in the block.
                 for name, param in tree_flatten(b.parameters()):
-                    if param.ndim == 2 and "embed" not in name:
+                    if (param.ndim == 2 and "embed" not in name
+                            and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+                            and min(param.shape) > 2):
                         # Navigate to the actual attribute and set it.
                         parts = name.split(".")
                         obj = b

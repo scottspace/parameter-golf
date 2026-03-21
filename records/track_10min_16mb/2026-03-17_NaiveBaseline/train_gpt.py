@@ -877,7 +877,11 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
         if use_ortho_init:
             for name, param in self.blocks.named_parameters():
-                if param.ndim == 2 and "embed" not in name and not getattr(param, "_zero_init", False):
+                if (param.ndim == 2
+                    and "embed" not in name
+                    and not getattr(param, "_zero_init", False)
+                    and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+                    and min(param.shape) > 2):
                     param.data.copy_(ortho_init_weight(param.shape))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
