@@ -1,4 +1,4 @@
-# Factorized MoE with int6+zstd
+# LoMoE — Low-Rank Mixture of Experts
 
 ## Score: val_bpb = TBD
 
@@ -6,12 +6,12 @@
 
 ## Method
 
-Each transformer layer uses a mixture of 8 factorized experts
-(top-2 routing) instead of a single MLP. Expert weights are
-parameterized as W=UV (rank-64), reducing per-expert storage.
-At submission time, U and V are quantized to int6 per-row and
-compressed with zstd-22. This stacks two orthogonal compression
-axes: rank reduction and quantization.
+LoMoE replaces each transformer layer's MLP with a mixture of 8
+low-rank experts (top-2 routing). Expert weights are parameterized
+as W=UV (rank-64), reducing per-expert storage. At submission time,
+U and V are quantized to int6 per-row and compressed with zstd-22.
+This stacks two orthogonal compression axes: rank reduction and
+quantization.
 
 Attention uses dense Q with factorized K (rank-16), V (rank-16),
 and output projection (rank-32).

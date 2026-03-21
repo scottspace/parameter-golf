@@ -2,7 +2,7 @@
 set -euo pipefail
 cd /workspace/parameter-golf
 
-SCRIPT=records/track_10min_16mb/2026-03-22_FactorizedMoE_Int6_zstd/train_gpt.py
+SCRIPT=records/track_10min_16mb/2026-03-22_LoMoE/train_gpt.py
 RUN_ID=${1:-factorized_moe}
 
 env \
