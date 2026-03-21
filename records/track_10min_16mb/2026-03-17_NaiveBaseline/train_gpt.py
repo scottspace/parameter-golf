@@ -789,33 +789,43 @@ class MoEMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])  # (B*S, dim)
+        x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
+        N, D = x_flat.shape
 
-        # Router
-        logits = self.router(x_flat)  # (B*S, num_experts)
-        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)  # (B*S, K)
-        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (B*S, K)
+        logits = self.router(x_flat)  # (N, E)
+        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, K)
 
         # Load balancing auxiliary loss
-        probs = F.softmax(logits, dim=-1)  # (B*S, E)
-        avg_probs = probs.mean(dim=0)  # (E,)
-        mask = F.one_hot(top_k_indices, self.num_experts).sum(dim=1).float()  # (B*S, E)
-        tokens_per_expert = mask.mean(dim=0)  # (E,)
-        self.aux_loss = (avg_probs * tokens_per_expert).sum() * self.num_experts
+        probs = F.softmax(logits, dim=-1)
+        one_hot = F.one_hot(top_k_indices, self.num_experts).sum(dim=1).float()
+        self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * self.num_experts
 
-        # Dispatch: compute only selected experts per token
-        output = torch.zeros_like(x_flat)
-        for k in range(self.top_k):
-            expert_indices = top_k_indices[:, k]  # (B*S,)
-            weights = top_k_weights[:, k]  # (B*S,)
-            for e in range(self.num_experts):
-                mask_e = (expert_indices == e)
-                if not mask_e.any():
-                    continue
-                expert_input = x_flat[mask_e]
-                expert_output = self.experts[e](expert_input)
-                output[mask_e] += weights[mask_e].unsqueeze(-1) * expert_output
+        # Sort-based sparse dispatch: group tokens by expert for contiguous batching.
+        flat_ids = top_k_indices.reshape(-1)  # (N*K,)
+        flat_w = top_k_weights.reshape(-1, 1)  # (N*K, 1)
+        flat_x = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*K, D)
 
+        order = flat_ids.argsort(stable=True)
+        sorted_x = flat_x[order]
+        sorted_ids = flat_ids[order]
+
+        # Expert boundaries via cumulative counts
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.long, device=x.device)
+        counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
+        offsets = counts.cumsum(0)
+
+        # Run each expert only on its assigned tokens
+        parts = []
+        for e in range(self.num_experts):
+            s = offsets[e].item()
+            t = offsets[e + 1].item()
+            if s < t:
+                parts.append(self.experts[e](sorted_x[s:t]))
+        sorted_out = torch.cat(parts, dim=0) * flat_w[order]
+
+        # Unsort and sum K contributions per token
+        output = sorted_out[order.argsort()].reshape(N, self.top_k, D).sum(dim=1)
         return output.reshape(orig_shape)
 
 
@@ -1152,7 +1162,10 @@ def main() -> None:
         log0(f"factorized_attn:enabled k_rank={args.attn_k_rank} v_rank={args.attn_v_rank} proj_rank={args.attn_proj_rank}")
     else:
         log0("factorized_attn:disabled")
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.use_moe:
+        compiled_model = torch.compile(base_model)
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:

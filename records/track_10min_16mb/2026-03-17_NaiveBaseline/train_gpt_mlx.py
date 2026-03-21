@@ -512,30 +512,29 @@ class MoEMLP(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])
+        x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
 
         logits = x_flat @ self.router_weight.astype(x_flat.dtype)  # (N, E)
 
-        # Top-K: create gating weights
+        # Top-K selection
         top_k_indices = mx.argpartition(-logits, kth=self.top_k, axis=-1)[:, :self.top_k]
-        # Create mask: 1 for top-K, 0 otherwise
-        mask = mx.zeros_like(logits)
-        for k in range(self.top_k):
-            mask = mask + mx.one_hot(top_k_indices[:, k], self.num_experts).astype(mask.dtype)
-        # Softmax only over top-K (mask others to -inf)
-        gating = mx.softmax(mx.where(mask > 0, logits, mx.array(-1e9).astype(logits.dtype)), axis=-1) * mask
+        top_k_logits = mx.take_along_axis(logits, top_k_indices, axis=-1)
+        top_k_weights = mx.softmax(top_k_logits, axis=-1)  # (N, K)
 
         # Load balancing auxiliary loss
         probs = mx.softmax(logits, axis=-1)
-        tokens_per_expert = mx.mean(mask, axis=0) / self.top_k
-        self.aux_loss = mx.sum(mx.mean(probs, axis=0) * tokens_per_expert) * self.num_experts
+        one_hot_sum = sum(mx.one_hot(top_k_indices[:, k], self.num_experts) for k in range(self.top_k))
+        self.aux_loss = mx.sum(mx.mean(probs, axis=0) * mx.mean(one_hot_sum, axis=0)) * self.num_experts
 
-        # Compute each expert and blend with gating weights
-        output = mx.zeros_like(x_flat)
-        for e in range(self.num_experts):
-            g = gating[:, e:e+1]  # (N, 1)
-            output = output + g * self.experts[e](x_flat)
+        # Compute all experts (cheap since factorized), stack, then gather top-K.
+        expert_outputs = mx.stack([e(x_flat) for e in self.experts], axis=1)  # (N, E, D)
 
+        # Gather top-K expert outputs: (N, K, D)
+        idx = mx.broadcast_to(top_k_indices[:, :, None], top_k_indices.shape + (x_flat.shape[-1],))
+        selected = mx.take_along_axis(expert_outputs, idx, axis=1)  # (N, K, D)
+
+        # Weighted sum over K experts
+        output = mx.sum(selected * top_k_weights[:, :, None], axis=1)  # (N, D)
         return output.reshape(orig_shape)
 
 
