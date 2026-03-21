@@ -1166,7 +1166,7 @@ def main() -> None:
         log0("factorized_attn:disabled")
     if args.use_moe:
         torch._dynamo.config.capture_scalar_outputs = True
-        compiled_model = torch.compile(base_model)
+        compiled_model = torch.compile(base_model, dynamic=True)
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
