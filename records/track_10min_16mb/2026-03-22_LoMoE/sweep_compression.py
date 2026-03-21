@@ -100,6 +100,7 @@ def main():
 
     # Sanity check: eval the raw (unquantized) model first
     model.load_state_dict(state_dict, strict=True)
+    model = torch.compile(model, dynamic=False, fullgraph=True)
     n = sum(p.numel() for p in model.parameters())
     print(f"Model params: {n} | use_moe={args.use_moe} experts={args.moe_num_experts} factor_mlp={args.use_factor_mlp} factor_attn={args.use_factor_attn}")
     print(f"bigram_hash={args.use_bigram_hash} smear_gate={args.use_smear_gate} ortho_init={args.use_ortho_init}")
