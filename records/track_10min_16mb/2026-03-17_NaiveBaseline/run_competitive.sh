@@ -28,7 +28,7 @@ env \
     TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
     VOCAB_SIZE=1024 \
     \
-    NUM_LAYERS=10 \
+    NUM_LAYERS=8 \
     MODEL_DIM=512 \
     NUM_HEADS=8 \
     NUM_KV_HEADS=4 \
@@ -66,6 +66,9 @@ env \
     USE_SMEAR_GATE=1 \
     USE_ORTHO_INIT=1 \
     USE_SWIGLU=1 \
+    USE_MOE=1 \
+    MOE_NUM_EXPERTS=15 \
+    MOE_TOP_K=2 \
     USE_MUP=1 \
     MUP_BASE_DIM=256 \
     \

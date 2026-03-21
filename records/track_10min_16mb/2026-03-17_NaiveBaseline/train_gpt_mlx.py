@@ -136,6 +136,12 @@ class Hyperparameters:
     # SwiGLU activation in MLP (replaces relu^2).
     use_swiglu: bool = bool(int(os.environ.get("USE_SWIGLU", "0")))
 
+    # Mixture of Experts: replace single MLP with multiple factorized expert MLPs + router.
+    use_moe: bool = bool(int(os.environ.get("USE_MOE", "0")))
+    moe_num_experts: int = int(os.environ.get("MOE_NUM_EXPERTS", "15"))
+    moe_top_k: int = int(os.environ.get("MOE_TOP_K", "2"))
+    moe_aux_loss_coeff: float = float(os.environ.get("MOE_AUX_LOSS_COEFF", "0.01"))
+
     # muP: scale init and output by width ratio for HP transfer.
     use_mup: bool = bool(int(os.environ.get("USE_MUP", "0")))
     mup_base_dim: int = int(os.environ.get("MUP_BASE_DIM", 256))
@@ -489,6 +495,50 @@ class MLP(nn.Module):
         return self.proj(x * x)
 
 
+class MoEMLP(nn.Module):
+    """Mixture of Experts MLP: multiple factorized expert MLPs with top-K routing."""
+
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int, top_k: int,
+                 use_factor: bool = False, rank: int = 32, use_swiglu: bool = False):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router_weight = mx.random.normal((dim, num_experts)) * 0.01
+        self.experts = [
+            MLP(dim, mlp_mult, use_factor=use_factor, rank=rank, use_swiglu=use_swiglu)
+            for _ in range(num_experts)
+        ]
+        self.aux_loss = mx.array(0.0)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+
+        logits = x_flat @ self.router_weight.astype(x_flat.dtype)  # (N, E)
+
+        # Top-K: create gating weights
+        top_k_indices = mx.argpartition(-logits, kth=self.top_k, axis=-1)[:, :self.top_k]
+        # Create mask: 1 for top-K, 0 otherwise
+        mask = mx.zeros_like(logits)
+        for k in range(self.top_k):
+            mask = mask + mx.one_hot(top_k_indices[:, k], self.num_experts).astype(mask.dtype)
+        # Softmax only over top-K (mask others to -inf)
+        gating = mx.softmax(mx.where(mask > 0, logits, mx.array(-1e9).astype(logits.dtype)), axis=-1) * mask
+
+        # Load balancing auxiliary loss
+        probs = mx.softmax(logits, axis=-1)
+        tokens_per_expert = mx.mean(mask, axis=0) / self.top_k
+        self.aux_loss = mx.sum(mx.mean(probs, axis=0) * tokens_per_expert) * self.num_experts
+
+        # Compute each expert and blend with gating weights
+        output = mx.zeros_like(x_flat)
+        for e in range(self.num_experts):
+            g = gating[:, e:e+1]  # (N, 1)
+            output = output + g * self.experts[e](x_flat)
+
+        return output.reshape(orig_shape)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -505,6 +555,9 @@ class Block(nn.Module):
         attn_v_rank: int = 32,
         attn_proj_rank: int = 32,
         use_swiglu: bool = False,
+        use_moe: bool = False,
+        moe_num_experts: int = 15,
+        moe_top_k: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNormNoWeight()
@@ -512,7 +565,11 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         use_factor_attn=use_factor_attn, attn_k_rank=attn_k_rank,
                                         attn_v_rank=attn_v_rank, attn_proj_rank=attn_proj_rank)
-        self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
+        if use_moe:
+            self.mlp = MoEMLP(dim, mlp_mult, num_experts=moe_num_experts, top_k=moe_top_k,
+                              use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
+        else:
+            self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
         self.attn_scale = mx.ones((dim,), dtype=mx.float32)
         self.mlp_scale = mx.ones((dim,), dtype=mx.float32)
         self.resid_mix = mx.array(np.stack((np.ones((dim,), dtype=np.float32), np.zeros((dim,), dtype=np.float32))))
@@ -534,13 +591,17 @@ class GPT(nn.Module):
                  attn_v_rank: int = 32, attn_proj_rank: int = 32,
                  use_bigram_hash: bool = False, bigram_hash_buckets: int = 4096,
                  use_smear_gate: bool = False, use_ortho_init: bool = False,
-                 use_swiglu: bool = False, use_mup: bool = False, mup_base_dim: int = 256):
+                 use_swiglu: bool = False, use_mup: bool = False, mup_base_dim: int = 256,
+                 use_moe: bool = False, moe_num_experts: int = 15, moe_top_k: int = 2,
+                 moe_aux_loss_coeff: float = 0.01):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
         self.logit_chunk_tokens = logit_chunk_tokens
         self.logit_softcap = logit_softcap
         self.mup_output_scale = (mup_base_dim / dim) if use_mup else 1.0
+        self.use_moe = use_moe
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
         self.bigram_hash = BigramHashEmbedding(bigram_hash_buckets, dim) if use_bigram_hash else None
@@ -554,7 +615,8 @@ class GPT(nn.Module):
                   use_factor_mlp=use_factor_mlp, mlp_low_rank_r=mlp_low_rank_r,
                   use_factor_attn=use_factor_attn, attn_k_rank=attn_k_rank,
                   attn_v_rank=attn_v_rank, attn_proj_rank=attn_proj_rank,
-                  use_swiglu=use_swiglu)
+                  use_swiglu=use_swiglu,
+                  use_moe=use_moe, moe_num_experts=moe_num_experts, moe_top_k=moe_top_k)
             for i in range(num_layers)
         ]
         self.final_norm = RMSNormNoWeight()
@@ -564,6 +626,7 @@ class GPT(nn.Module):
                 # Orthogonal init for all 2D weight matrices in the block.
                 for name, param in tree_flatten(b.parameters()):
                     if (param.ndim == 2 and "embed" not in name
+                            and "router" not in name
                             and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
                             and min(param.shape) > 2):
                         # Navigate to the actual attribute and set it.
@@ -574,7 +637,11 @@ class GPT(nn.Module):
                         setattr(obj, parts[-1], ortho_init_weight(param.shape))
             if isinstance(b.attn.proj, CastedLinear):
                 b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            if isinstance(b.mlp.proj, CastedLinear):
+            if isinstance(b.mlp, MoEMLP):
+                for expert in b.mlp.experts:
+                    if isinstance(expert.proj, CastedLinear):
+                        expert.proj.weight = mx.zeros_like(expert.proj.weight)
+            elif isinstance(b.mlp.proj, CastedLinear):
                 b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
         # muP: scale embedding init by sqrt(base_dim/dim) for HP transfer.
         emb_std = tied_embed_init_std * (math.sqrt(mup_base_dim / dim) if use_mup else 1.0)
@@ -615,14 +682,23 @@ class GPT(nn.Module):
         scale = self.mup_output_scale
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
             logits = self.softcap((x @ w) * scale)
-            return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
-        loss_sum = mx.array(0.0, dtype=mx.float32)
-        n = int(x.shape[0])
-        for s in range(0, n, self.logit_chunk_tokens):
-            e = min(s + self.logit_chunk_tokens, n)
-            logits = self.softcap((x[s:e] @ w) * scale)
-            loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
-        return loss_sum / float(n)
+            ce_loss = nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
+        else:
+            loss_sum = mx.array(0.0, dtype=mx.float32)
+            n = int(x.shape[0])
+            for s in range(0, n, self.logit_chunk_tokens):
+                e = min(s + self.logit_chunk_tokens, n)
+                logits = self.softcap((x[s:e] @ w) * scale)
+                loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
+            ce_loss = loss_sum / float(n)
+        # Accumulate MoE auxiliary losses if active.
+        if self.use_moe:
+            aux = mx.array(0.0, dtype=mx.float32)
+            for b in self.blocks:
+                if isinstance(b.mlp, MoEMLP):
+                    aux = aux + b.mlp.aux_loss
+            ce_loss = ce_loss + self.moe_aux_loss_coeff * aux
+        return ce_loss
 
 # ==============================================================================
 # OPTIMIZERS (MUON + ADAM SPLIT)
@@ -670,12 +746,15 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if k.startswith("blocks.") and p.ndim == 2
+               and "router" not in k
+               and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights" or (k.startswith("blocks.") and (
+                p.ndim < 2 or "router" in k or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -1089,6 +1168,10 @@ def main() -> None:
         use_swiglu=args.use_swiglu,
         use_mup=args.use_mup,
         mup_base_dim=args.mup_base_dim,
+        use_moe=args.use_moe,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_aux_loss_coeff=args.moe_aux_loss_coeff,
     )
     opt = SplitOptimizers(model, args)
 

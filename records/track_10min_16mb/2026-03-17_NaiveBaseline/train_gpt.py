@@ -132,6 +132,12 @@ class Hyperparameters:
     # SwiGLU activation in MLP (replaces relu^2).
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
 
+    # Mixture of Experts: replace single MLP with multiple expert MLPs + router.
+    use_moe = bool(int(os.environ.get("USE_MOE", "0")))
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "15"))
+    moe_top_k = int(os.environ.get("MOE_TOP_K", "2"))
+    moe_aux_loss_coeff = float(os.environ.get("MOE_AUX_LOSS_COEFF", "0.01"))
+
     # muP: scale init and output by width ratio for HP transfer.
     use_mup = bool(int(os.environ.get("USE_MUP", "0")))
     mup_base_dim = int(os.environ.get("MUP_BASE_DIM", 256))
@@ -766,6 +772,53 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class MoEMLP(nn.Module):
+    """Mixture of Experts MLP: routes each token to top-K expert MLPs."""
+
+    def __init__(self, dim: int, mlp_mult: int, num_experts: int, top_k: int,
+                 use_factor: bool = False, rank: int = 32, use_swiglu: bool = False):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+        self.router = nn.Linear(dim, num_experts, bias=False)
+        self.experts = nn.ModuleList([
+            MLP(dim, mlp_mult, use_factor=use_factor, rank=rank, use_swiglu=use_swiglu)
+            for _ in range(num_experts)
+        ])
+        self.aux_loss = torch.tensor(0.0)
+
+    def forward(self, x: Tensor) -> Tensor:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])  # (B*S, dim)
+
+        # Router
+        logits = self.router(x_flat)  # (B*S, num_experts)
+        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)  # (B*S, K)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (B*S, K)
+
+        # Load balancing auxiliary loss
+        probs = F.softmax(logits, dim=-1)  # (B*S, E)
+        avg_probs = probs.mean(dim=0)  # (E,)
+        mask = F.one_hot(top_k_indices, self.num_experts).sum(dim=1).float()  # (B*S, E)
+        tokens_per_expert = mask.mean(dim=0)  # (E,)
+        self.aux_loss = (avg_probs * tokens_per_expert).sum() * self.num_experts
+
+        # Dispatch: compute only selected experts per token
+        output = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            expert_indices = top_k_indices[:, k]  # (B*S,)
+            weights = top_k_weights[:, k]  # (B*S,)
+            for e in range(self.num_experts):
+                mask_e = (expert_indices == e)
+                if not mask_e.any():
+                    continue
+                expert_input = x_flat[mask_e]
+                expert_output = self.experts[e](expert_input)
+                output[mask_e] += weights[mask_e].unsqueeze(-1) * expert_output
+
+        return output.reshape(orig_shape)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -782,6 +835,9 @@ class Block(nn.Module):
         attn_v_rank: int = 32,
         attn_proj_rank: int = 32,
         use_swiglu: bool = False,
+        use_moe: bool = False,
+        moe_num_experts: int = 15,
+        moe_top_k: int = 2,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -789,7 +845,12 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         use_factor_attn=use_factor_attn, attn_k_rank=attn_k_rank,
                                         attn_v_rank=attn_v_rank, attn_proj_rank=attn_proj_rank)
-        self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
+        if use_moe:
+            self.mlp = MoEMLP(dim, mlp_mult, moe_num_experts, moe_top_k,
+                              use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
+        else:
+            self.mlp = MLP(dim, mlp_mult, use_factor=use_factor_mlp, rank=mlp_low_rank_r, use_swiglu=use_swiglu)
+        self.use_moe = use_moe
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -830,6 +891,10 @@ class GPT(nn.Module):
         use_swiglu: bool = False,
         use_mup: bool = False,
         mup_base_dim: int = 256,
+        use_moe: bool = False,
+        moe_num_experts: int = 15,
+        moe_top_k: int = 2,
+        moe_aux_loss_coeff: float = 0.01,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -838,6 +903,8 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.mup_output_scale = (mup_base_dim / model_dim) if use_mup else 1.0
+        self.use_moe = use_moe
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram_hash = BigramHashEmbedding(bigram_hash_buckets, model_dim) if use_bigram_hash else None
         self.smear_gate = SmearGate(model_dim) if use_smear_gate else None
@@ -861,6 +928,9 @@ class GPT(nn.Module):
                     attn_v_rank=attn_v_rank,
                     attn_proj_rank=attn_proj_rank,
                     use_swiglu=use_swiglu,
+                    use_moe=use_moe,
+                    moe_num_experts=moe_num_experts,
+                    moe_top_k=moe_top_k,
                 )
                 for i in range(num_layers)
             ]
@@ -882,6 +952,7 @@ class GPT(nn.Module):
             for name, param in self.blocks.named_parameters():
                 if (param.ndim == 2
                     and "embed" not in name
+                    and "router" not in name
                     and not getattr(param, "_zero_init", False)
                     and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
                     and min(param.shape) > 2):
@@ -916,7 +987,15 @@ class GPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits_proj = logits_proj * self.mup_output_scale
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # Accumulate MoE auxiliary losses for load balancing.
+        if self.use_moe:
+            aux_losses = [block.mlp.aux_loss for block in self.blocks if isinstance(block.mlp, MoEMLP)]
+            if aux_losses:
+                ce_loss = ce_loss + self.moe_aux_loss_coeff * sum(aux_losses) / len(aux_losses)
+
+        return ce_loss
 
 
 # -----------------------------
@@ -1043,6 +1122,10 @@ def main() -> None:
         use_swiglu=args.use_swiglu,
         use_mup=args.use_mup,
         mup_base_dim=args.mup_base_dim,
+        use_moe=args.use_moe,
+        moe_num_experts=args.moe_num_experts,
+        moe_top_k=args.moe_top_k,
+        moe_aux_loss_coeff=args.moe_aux_loss_coeff,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, (CastedLinear, LowRankLinear)):
@@ -1081,12 +1164,12 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and "router" not in name and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or "router" in name or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
