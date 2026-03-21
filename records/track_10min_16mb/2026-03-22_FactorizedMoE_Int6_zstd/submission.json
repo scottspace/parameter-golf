@@ -1,0 +1,12 @@
+{
+  "author": "Scott Penberthy",
+  "github_id": "scottspace",
+  "name": "Factorized MoE with int6+zstd",
+  "blurb": "8-layer, 512-dim, 8 experts/layer (top-2). MLP experts factorized as W=UV (rank-64). Attention K/V rank-16, proj rank-32. Compression: factorization then int6 per-row quantization + zstd-22. WD=0.04, grad_clip=0.3, SWA last 50%, seq_len=2048, batch=786432, warmdown=3000.",
+  "date": null,
+  "val_loss": null,
+  "val_bpb": null,
+  "bytes_total": null,
+  "bytes_model": null,
+  "bytes_code": null
+}
