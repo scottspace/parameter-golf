@@ -1165,6 +1165,7 @@ def main() -> None:
     else:
         log0("factorized_attn:disabled")
     if args.use_moe:
+        torch._dynamo.config.capture_scalar_outputs = True
         compiled_model = torch.compile(base_model)
     else:
         compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
