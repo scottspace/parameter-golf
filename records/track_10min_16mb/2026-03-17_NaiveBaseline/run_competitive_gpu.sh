@@ -7,6 +7,7 @@ set -euo pipefail
 cd /workspace/parameter-golf
 
 SCRIPT=records/track_10min_16mb/2026-03-17_NaiveBaseline/train_gpt.py
+ITERATIONS=${2:-3600}
 RUN_ID=${1:-competitive_gpu_v1}
 
 env \
@@ -30,7 +31,8 @@ env \
     \
     TRAIN_SEQ_LEN=2048 \
     TRAIN_BATCH_TOKENS=786432 \
-    MAX_WALLCLOCK_SECONDS=600 \
+    ITERATIONS=$ITERATIONS \
+    MAX_WALLCLOCK_SECONDS=0 \
     WARMUP_STEPS=20 \
     WARMDOWN_ITERS=3000 \
     TRAIN_LOG_EVERY=100 \
