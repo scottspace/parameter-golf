@@ -1365,8 +1365,9 @@ def main() -> None:
 
     if not args.skip_final_eval:
         if master_process:
-            torch.save(base_model.state_dict(), "final_model.pt")
-            model_bytes = os.path.getsize("final_model.pt")
+            raw_filename = f"logs/{args.run_id}_model.pt"
+            torch.save(base_model.state_dict(), raw_filename)
+            model_bytes = os.path.getsize(raw_filename)
             code_bytes = len(code.encode("utf-8"))
             log0(f"Serialized model: {model_bytes} bytes")
             log0(f"Code size: {code_bytes} bytes")
@@ -1384,7 +1385,7 @@ def main() -> None:
             quant_blob = zlib.compress(quant_raw, level=9)
             compress_label = "zlib-9"
         quant_raw_bytes = len(quant_raw)
-        ptz_filename = f"final_model.int{qbits}.ptz"
+        ptz_filename = f"logs/{args.run_id}_model.int{qbits}.ptz"
         if master_process:
             with open(ptz_filename, "wb") as f:
                 f.write(quant_blob)
