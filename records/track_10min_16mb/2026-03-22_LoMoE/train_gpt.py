@@ -36,15 +36,6 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-# -----------------------------
-# HYPERPARAMETERS
-# -----------------------------
-# Default Simple Baseline run:
-# - 9 transformer blocks at width 512
-# - 8 attention heads with 4 KV heads (GQA) and 2x MLP expansion
-# - vocab size 1024, sequence length 1024, tied embeddings
-# - 524,288 train tokens per step for 20,000 iterations with a ~10 minute cap
-
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
     data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
@@ -147,13 +138,6 @@ class Hyperparameters:
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "0")))
     zstd_level = int(os.environ.get("ZSTD_LEVEL", 22))
 
-# -----------------------------
-# MUON OPTIMIZER 
-# -----------------------------
-# 
-# As borrowed from modded-nanogpt
-# Background on Muon: https://kellerjordan.github.io/posts/muon/
-
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
     # Muon uses this to normalize matrix-shaped gradients before applying them.
@@ -234,15 +218,6 @@ class Muon(torch.optim.Optimizer):
 
         return loss
 
-
-# -----------------------------
-# TOKENIZER-AGNOSTIC EVALUATION SETUP 
-# -----------------------------
-#
-# It's common for small models have a large fraction of their parameters be embeddings, since the 2 * d_model * d_vocab vectors can be gigantic.
-# Instead of locking the tokenizer, we let you bring your own and calculate our validation metrics on the average compression of the validation set.
-# We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
-# Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
 def build_sentencepiece_luts(
     sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
@@ -343,14 +318,6 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
-
-# -----------------------------
-# POST-TRAINING QUANTIZATION
-# -----------------------------
-#
-# It's silly to export our model, which is trained in bf16 and fp32, at that same precision.
-# Instead, we get approximately the same model (with a small hit) by quantizing the model to int8 & zlib compressing.
-# We can then decompress the model and run in higher precision for evaluation, after closing in under the size limit.
 
 CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
@@ -489,10 +456,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
     return out
 
 
-# -----------------------------
-# DATA LOADING
-# -----------------------------
-
 def load_data_shard(file: Path) -> Tensor:
     header_bytes = 256 * np.dtype("<i4").itemsize
     token_bytes = np.dtype("<u2").itemsize
@@ -559,10 +522,6 @@ class DistributedTokenLoader:
         x = local[:-1].reshape(-1, seq_len)
         y = local[1:].reshape(-1, seq_len)
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
-
-# -----------------------------
-# TRANSFORMER MODULES
-# -----------------------------
 
 class RMSNorm(nn.Module):
     def __init__(self, eps: float | None = None):
@@ -773,13 +732,15 @@ class MLP(nn.Module):
 
 
 class MoEMLP(nn.Module):
-    """Mixture of Experts MLP: routes each token to top-K expert MLPs."""
+    """Mixture of Experts MLP with batched matmul for factorized experts."""
 
     def __init__(self, dim: int, mlp_mult: int, num_experts: int, top_k: int,
                  use_factor: bool = False, rank: int = 32, use_swiglu: bool = False):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.use_factor = use_factor
+        self.use_swiglu = use_swiglu
         self.router = nn.Linear(dim, num_experts, bias=False)
         self.experts = nn.ModuleList([
             MLP(dim, mlp_mult, use_factor=use_factor, rank=rank, use_swiglu=use_swiglu)
@@ -789,42 +750,57 @@ class MoEMLP(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
+        x_flat = x.reshape(-1, x.shape[-1])
         N, D = x_flat.shape
+        E = self.num_experts
 
-        logits = self.router(x_flat)  # (N, E)
+        logits = self.router(x_flat)
         top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)
-        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, K)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)
 
         # Load balancing auxiliary loss
         probs = F.softmax(logits, dim=-1)
-        one_hot = F.one_hot(top_k_indices, self.num_experts).sum(dim=1).float()
-        self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * self.num_experts
+        one_hot = F.one_hot(top_k_indices, E).sum(dim=1).float()
+        self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * E
 
-        # Sort-based sparse dispatch: group tokens by expert for contiguous batching.
-        flat_ids = top_k_indices.reshape(-1)  # (N*K,)
-        flat_w = top_k_weights.reshape(-1, 1)  # (N*K, 1)
-        flat_x = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)  # (N*K, D)
+        # Sort tokens by expert for contiguous grouping
+        flat_ids = top_k_indices.reshape(-1)
+        flat_w = top_k_weights.reshape(-1, 1)
+        flat_x = x_flat.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, D)
+        NK = flat_ids.shape[0]
 
         order = flat_ids.argsort(stable=True)
         sorted_x = flat_x[order]
         sorted_ids = flat_ids[order]
 
-        # Expert boundaries via cumulative counts
-        counts = torch.zeros(self.num_experts + 1, dtype=torch.long, device=x.device)
+        counts = torch.zeros(E + 1, dtype=torch.long, device=x.device)
         counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
         offsets = counts.cumsum(0)
+        max_count = counts[1:].max().item()
 
-        # Run each expert only on its assigned tokens
-        parts = []
-        for e in range(self.num_experts):
-            s = offsets[e].item()
-            t = offsets[e + 1].item()
-            if s < t:
-                parts.append(self.experts[e](sorted_x[s:t]))
-        sorted_out = torch.cat(parts, dim=0) * flat_w[order]
+        if self.use_factor and not self.use_swiglu:
+            # Fast path: pad tokens into (E, max_count, D), run 4 bmm calls.
+            pos = torch.arange(NK, device=x.device) - offsets[sorted_ids]
+            x_pad = sorted_x.new_zeros(E, max_count, D)
+            x_pad[sorted_ids, pos] = sorted_x
+            dt = x_pad.dtype
+            V_fc = torch.stack([e.fc.V.to(dt) for e in self.experts])
+            U_fc = torch.stack([e.fc.U.to(dt) for e in self.experts])
+            V_pj = torch.stack([e.proj.V.to(dt) for e in self.experts])
+            U_pj = torch.stack([e.proj.U.to(dt) for e in self.experts])
+            h = torch.bmm(torch.bmm(x_pad, V_fc.transpose(1, 2)), U_fc.transpose(1, 2))
+            h = torch.relu(h).square()
+            h = torch.bmm(torch.bmm(h, V_pj.transpose(1, 2)), U_pj.transpose(1, 2))
+            sorted_out = h[sorted_ids, pos] * flat_w[order]
+        else:
+            # Fallback: sequential per-expert dispatch
+            parts = []
+            for e in range(E):
+                s, t = offsets[e].item(), offsets[e + 1].item()
+                if s < t:
+                    parts.append(self.experts[e](sorted_x[s:t]))
+            sorted_out = torch.cat(parts, dim=0) * flat_w[order]
 
-        # Unsort and sum K contributions per token
         output = sorted_out[order.argsort()].reshape(N, self.top_k, D).sum(dim=1)
         return output.reshape(orig_shape)
 
@@ -1007,10 +983,6 @@ class GPT(nn.Module):
 
         return ce_loss
 
-
-# -----------------------------
-# TRAINING
-# -----------------------------
 
 def main() -> None:
     global zeropower_via_newtonschulz5
