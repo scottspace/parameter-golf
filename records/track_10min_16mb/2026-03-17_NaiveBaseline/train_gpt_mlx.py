@@ -407,9 +407,11 @@ def ortho_init_weight(shape: tuple[int, ...]) -> mx.array:
     """Orthogonal initialization for 2D weight matrices."""
     assert len(shape) == 2
     m, n = shape
-    flat = np.random.randn(max(m, n), min(m, n)).astype(np.float32)
-    q, _ = np.linalg.qr(flat)
-    return mx.array(q[:m, :n].copy())
+    if m >= n:
+        q, _ = np.linalg.qr(np.random.randn(m, n).astype(np.float32))
+        return mx.array(q.copy())
+    q, _ = np.linalg.qr(np.random.randn(n, m).astype(np.float32))
+    return mx.array(q[:m, :].copy())
 
 
 class CausalSelfAttention(nn.Module):

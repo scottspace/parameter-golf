@@ -597,9 +597,11 @@ def ortho_init_weight(shape: tuple[int, ...]) -> Tensor:
     """Orthogonal initialization for 2D weight matrices."""
     assert len(shape) == 2
     m, n = shape
-    flat = torch.randn(max(m, n), min(m, n))
-    q, _ = torch.linalg.qr(flat)
-    return q[:m, :n].contiguous()
+    if m >= n:
+        q, _ = torch.linalg.qr(torch.randn(m, n))
+        return q.contiguous()
+    q, _ = torch.linalg.qr(torch.randn(n, m))
+    return q[:m, :].contiguous()
 
 
 class CastedLinear(nn.Linear):
