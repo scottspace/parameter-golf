@@ -25,6 +25,8 @@ def load_config(model_path):
             config = json.load(f)
         for k, v in config.items():
             if k.startswith("_") or k == "n_params": continue
+            if isinstance(v, bool):
+                v = "1" if v else "0"
             os.environ[k.upper()] = str(v)
     else:
         print(f"WARNING: no config found, using env vars / defaults")
