@@ -98,6 +98,11 @@ def main():
         if isinstance(m, (CastedLinear, LowRankLinear)): m.float()
     restore_low_dim_params_to_fp32(model)
 
+    # Sanity check: eval the raw (unquantized) model first
+    model.load_state_dict(state_dict, strict=True)
+    vl0, vb0 = eval_val(args, model, 0, 1, device, 1, val_tokens, *luts)
+    print(f"\nPre-quant baseline: val_loss={vl0:.4f} val_bpb={vb0:.4f}")
+
     print(f"\n{'bits':>4} {'compress':>10} {'val_loss':>10} {'val_bpb':>10} {'MB':>8}")
     print("-" * 50)
     for bits, method, level, sz, mb, fits, qobj in results:
