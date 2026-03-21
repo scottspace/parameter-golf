@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Sweep quantization/compression on a saved model. No retraining."""
-import io, os, sys, zlib, torch
+import io, os, sys, zlib
+os.chdir("/workspace/parameter-golf")
+import torch
 sys.path.insert(0, os.path.dirname(__file__))
 from train_gpt import (quantize_state_dict_int8, dequantize_state_dict_int8,
     GPT, Hyperparameters, eval_val, load_validation_tokens, build_sentencepiece_luts,
@@ -9,7 +11,11 @@ import sentencepiece as spm
 try:
     import pyzstd; HAS_ZSTD = True
 except ImportError:
-    HAS_ZSTD = False
+    os.system("pip install -q pyzstd")
+    try:
+        import pyzstd; HAS_ZSTD = True
+    except ImportError:
+        HAS_ZSTD = False
 
 def compress(data, method, level):
     if method == "zstd" and HAS_ZSTD:
