@@ -100,6 +100,12 @@ def main():
 
     # Sanity check: eval the raw (unquantized) model first
     model.load_state_dict(state_dict, strict=True)
+    n = sum(p.numel() for p in model.parameters())
+    print(f"Model params: {n} | use_moe={args.use_moe} experts={args.moe_num_experts} factor_mlp={args.use_factor_mlp} factor_attn={args.use_factor_attn}")
+    print(f"bigram_hash={args.use_bigram_hash} smear_gate={args.use_smear_gate} ortho_init={args.use_ortho_init}")
+    # Check a sample weight to verify it loaded correctly
+    sample = list(state_dict.values())[0]
+    print(f"Sample weight: {list(state_dict.keys())[0]} shape={sample.shape} dtype={sample.dtype} mean={sample.float().mean():.6f}")
     vl0, vb0 = eval_val(args, model, 0, 1, device, 1, val_tokens, *luts)
     print(f"\nPre-quant baseline: val_loss={vl0:.4f} val_bpb={vb0:.4f}")
 
