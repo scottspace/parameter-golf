@@ -2,6 +2,9 @@
 set -euo pipefail
 cd /workspace/parameter-golf
 
+# Ensure zstd compression is available
+pip install -q pyzstd 2>/dev/null || true
+
 SCRIPT=records/track_10min_16mb/2026-03-22_LoMoE/train_gpt.py
 RUN_ID=${1:-factorized_moe}
 
@@ -48,7 +51,7 @@ env \
     SWA_START_FRAC=0.5 \
     SWA_EVERY=50 \
     \
-    QUANT_BITS=6 \
+    QUANT_BITS=8 \
     USE_ZSTD=1 \
     ZSTD_LEVEL=22 \
     \
