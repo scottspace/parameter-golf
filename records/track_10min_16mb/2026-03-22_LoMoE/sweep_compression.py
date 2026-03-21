@@ -1,13 +1,8 @@
 #!/usr/bin/env python3
 """Sweep quantization/compression on a saved model. No retraining."""
-import io, os, sys, zlib
+import io, json, os, sys, zlib
 os.chdir("/workspace/parameter-golf")
-import torch
-sys.path.insert(0, os.path.dirname(__file__))
-from train_gpt import (quantize_state_dict_int8, dequantize_state_dict_int8,
-    GPT, Hyperparameters, eval_val, load_validation_tokens, build_sentencepiece_luts,
-    CastedLinear, LowRankLinear, restore_low_dim_params_to_fp32, MoEMLP)
-import sentencepiece as spm
+
 try:
     import pyzstd; HAS_ZSTD = True
 except ImportError:
@@ -17,17 +12,9 @@ except ImportError:
     except ImportError:
         HAS_ZSTD = False
 
-def compress(data, method, level):
-    if method == "zstd" and HAS_ZSTD:
-        return pyzstd.compress(data, level)
-    return zlib.compress(data, min(level, 9))
-
 def load_config(model_path):
-    """Load config JSON saved alongside the model (same prefix, _config.json)."""
-    import json as _json
     config_path = model_path.replace("_model.pt", "_config.json")
     if not os.path.exists(config_path):
-        # Try legacy path: final_model.pt -> look for any *_config.json in logs/
         d = os.path.dirname(model_path) or "."
         candidates = [f for f in os.listdir(d) if f.endswith("_config.json")]
         if candidates:
@@ -35,12 +22,17 @@ def load_config(model_path):
     if os.path.exists(config_path):
         print(f"Loading config from {config_path}")
         with open(config_path) as f:
-            config = _json.load(f)
+            config = json.load(f)
         for k, v in config.items():
             if k.startswith("_") or k == "n_params": continue
-            os.environ.setdefault(k.upper(), str(v))
+            os.environ[k.upper()] = str(v)
     else:
         print(f"WARNING: no config found, using env vars / defaults")
+
+def compress(data, method, level):
+    if method == "zstd" and HAS_ZSTD:
+        return pyzstd.compress(data, level)
+    return zlib.compress(data, min(level, 9))
 
 def main():
     model_path = sys.argv[1] if len(sys.argv) > 1 else None
@@ -48,7 +40,16 @@ def main():
     if not model_path or model_path.startswith("--"):
         print("Usage: python sweep_compression.py <model.pt> [--eval]"); return
 
+    # Load config BEFORE importing train_gpt (Hyperparameters reads env vars at import time)
     load_config(model_path)
+
+    import torch
+    sys.path.insert(0, os.path.dirname(__file__))
+    from train_gpt import (quantize_state_dict_int8, dequantize_state_dict_int8,
+        GPT, Hyperparameters, eval_val, load_validation_tokens, build_sentencepiece_luts,
+        CastedLinear, LowRankLinear, restore_low_dim_params_to_fp32, MoEMLP)
+    import sentencepiece as spm
+
     print(f"Loading {model_path}...")
     state_dict = torch.load(model_path, map_location="cpu", weights_only=False)
     combos = []
