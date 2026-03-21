@@ -778,28 +778,13 @@ class MoEMLP(nn.Module):
         offsets = counts.cumsum(0)
         max_count = counts[1:].max().item()
 
-        if self.use_factor and not self.use_swiglu:
-            # Fast path: pad tokens into (E, max_count, D), run 4 bmm calls.
-            pos = torch.arange(NK, device=x.device) - offsets[sorted_ids]
-            x_pad = sorted_x.new_zeros(E, max_count, D)
-            x_pad[sorted_ids, pos] = sorted_x
-            dt = x_pad.dtype
-            V_fc = torch.stack([e.fc.V.to(dt) for e in self.experts])
-            U_fc = torch.stack([e.fc.U.to(dt) for e in self.experts])
-            V_pj = torch.stack([e.proj.V.to(dt) for e in self.experts])
-            U_pj = torch.stack([e.proj.U.to(dt) for e in self.experts])
-            h = torch.bmm(torch.bmm(x_pad, V_fc.transpose(1, 2)), U_fc.transpose(1, 2))
-            h = torch.relu(h).square()
-            h = torch.bmm(torch.bmm(h, V_pj.transpose(1, 2)), U_pj.transpose(1, 2))
-            sorted_out = h[sorted_ids, pos] * flat_w[order]
-        else:
-            # Fallback: sequential per-expert dispatch
-            parts = []
-            for e in range(E):
-                s, t = offsets[e].item(), offsets[e + 1].item()
-                if s < t:
-                    parts.append(self.experts[e](sorted_x[s:t]))
-            sorted_out = torch.cat(parts, dim=0) * flat_w[order]
+        # Run each expert on its contiguous token slice.
+        parts = []
+        for e in range(E):
+            s, t = offsets[e].item(), offsets[e + 1].item()
+            if s < t:
+                parts.append(self.experts[e](sorted_x[s:t]))
+        sorted_out = torch.cat(parts, dim=0) * flat_w[order]
 
         output = sorted_out[order.argsort()].reshape(N, self.top_k, D).sum(dim=1)
         return output.reshape(orig_shape)
