@@ -411,7 +411,7 @@ def ortho_init_weight(shape: tuple[int, ...]) -> mx.array:
         q, _ = np.linalg.qr(np.random.randn(m, n).astype(np.float32))
         return mx.array(q.copy())
     q, _ = np.linalg.qr(np.random.randn(n, m).astype(np.float32))
-    return mx.array(q[:m, :].copy())
+    return mx.array(q.T.copy())
 
 
 class CausalSelfAttention(nn.Module):

@@ -600,8 +600,9 @@ def ortho_init_weight(shape: tuple[int, ...]) -> Tensor:
     if m >= n:
         q, _ = torch.linalg.qr(torch.randn(m, n))
         return q.contiguous()
+    # Wide matrix: compute ortho for transposed shape, then transpose back.
     q, _ = torch.linalg.qr(torch.randn(n, m))
-    return q[:m, :].contiguous()
+    return q.T.contiguous()
 
 
 class CastedLinear(nn.Linear):
