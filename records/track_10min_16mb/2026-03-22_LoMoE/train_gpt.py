@@ -5,6 +5,8 @@ Hard stop: `train_gpt.py` and `train_gpt_mlx.py` must never be longer than 1500 
 """
 
 from __future__ import annotations
+import warnings
+warnings.filterwarnings("ignore", message=".*Online softmax.*")
 
 import copy
 import glob
