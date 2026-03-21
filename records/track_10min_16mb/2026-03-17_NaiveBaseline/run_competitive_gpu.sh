@@ -46,18 +46,15 @@ env \
     SWA_START_FRAC=0.5 \
     SWA_EVERY=50 \
     \
-    USE_BIGRAM_HASH=1 \
-    BIGRAM_HASH_BUCKETS=4096 \
-    \
-    USE_SMEAR_GATE=1 \
-    USE_ORTHO_INIT=1 \
-    USE_SWIGLU=1 \
+    USE_BIGRAM_HASH=0 \
+    USE_SMEAR_GATE=0 \
+    USE_ORTHO_INIT=0 \
+    USE_SWIGLU=0 \
     USE_MOE=1 \
-    MOE_NUM_EXPERTS=15 \
+    MOE_NUM_EXPERTS=8 \
     MOE_TOP_K=2 \
     MOE_AUX_LOSS_COEFF=0.01 \
-    USE_MUP=1 \
-    MUP_BASE_DIM=256 \
+    USE_MUP=0 \
     \
     QUANT_BITS=6 \
     USE_ZSTD=1 \
