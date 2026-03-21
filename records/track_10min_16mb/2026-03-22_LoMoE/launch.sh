@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+if [ "$1" = "kill" ]; then
+    pkill -f "train_gpt.py" && echo "Killed." || echo "Nothing running."
+    exit 0
+fi
+
 RUN_ID=${1:-lomoe_v1}
 LOGFILE=/workspace/parameter-golf/logs/${RUN_ID}.out
 
