@@ -56,7 +56,7 @@ env \
     SWA_START_FRAC=0.5 \
     SWA_EVERY=50 \
     \
-    QUANT_BITS=8 \
+    QUANT_BITS=6 \
     USE_ZSTD=1 \
     ZSTD_LEVEL=22 \
     \
