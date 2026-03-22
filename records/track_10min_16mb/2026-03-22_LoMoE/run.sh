@@ -58,6 +58,8 @@ env \
     SWA_START_FRAC=0.75 \
     SWA_EVERY=100 \
     \
+    USE_QAT=1 \
+    FP16_EMBED=1 \
     QUANT_BITS=8 \
     USE_ZSTD=1 \
     ZSTD_LEVEL=22 \

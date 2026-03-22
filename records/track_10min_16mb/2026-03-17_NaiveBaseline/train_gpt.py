@@ -139,6 +139,11 @@ class Hyperparameters:
     quant_bits = int(os.environ.get("QUANT_BITS", 8))
     use_zstd = bool(int(os.environ.get("USE_ZSTD", "0")))
     zstd_level = int(os.environ.get("ZSTD_LEVEL", 22))
+    fp16_embed = bool(int(os.environ.get("FP16_EMBED", "0")))
+
+    # QAT: fake-quantize weights during training so model learns quantization-robust values.
+    use_qat = bool(int(os.environ.get("USE_QAT", "0")))
+    qat_bits = int(os.environ.get("QAT_BITS", 0))  # 0 = use quant_bits
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
     # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
@@ -375,7 +380,7 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
 
-def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
+def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, fp16_embed: bool = False):
     # Single supported clean-script export format:
     # - per-row int8 for 2D float tensors
     # - per-tensor int8 for other float tensors
@@ -404,8 +409,12 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8):
             stats["int8_payload_bytes"] += tensor_nbytes(t)
             continue
 
-        # Small float tensors are cheap enough to keep directly. We still downcast
-        # fp32/bf16 passthrough tensors to fp16 so metadata does not dominate size.
+        if fp16_embed and "tok_emb" in name:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
         if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
             kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
             passthrough[name] = kept
@@ -535,7 +544,6 @@ class RMSNorm(nn.Module):
 
 
 class BigramHashEmbedding(nn.Module):
-    """Hash(prev_token, cur_token) into a small embedding table. Gives bigram context for free."""
     def __init__(self, num_buckets: int, dim: int):
         super().__init__()
         self.num_buckets = num_buckets
@@ -549,7 +557,6 @@ class BigramHashEmbedding(nn.Module):
 
 
 class SmearGate(nn.Module):
-    """Learned gate that blends each token embedding with its predecessor."""
     def __init__(self, dim: int):
         super().__init__()
         self.gate = nn.Parameter(torch.full((dim,), -2.0))  # sigmoid(-2) ≈ 0.12
@@ -572,33 +579,38 @@ def ortho_init_weight(shape: tuple[int, ...]) -> Tensor:
     return q.T.contiguous()
 
 
+_QAT_BITS: int = 0
+
+def _fake_quantize(w: Tensor) -> Tensor:
+    if _QAT_BITS <= 0 or not w.requires_grad: return w
+    mv = (1 << (_QAT_BITS - 1)) - 1
+    with torch.no_grad():
+        s = (w.abs().amax(dim=1, keepdim=True) if w.ndim == 2 else w.abs().amax()).clamp(min=1e-8) / mv
+        wq = (w / s).round().clamp(-mv, mv) * s
+    return w + (wq - w).detach()
+
+
 class CastedLinear(nn.Linear):
-    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
+        w = _fake_quantize(self.weight) if self.training else self.weight
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 class LowRankLinear(nn.Module):
-    """Linear layer parameterized as W = U @ V (pure low-rank, no residual).
-
-    U: (out_features, rank)
-    V: (rank, in_features)
-    """
-
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
-
-        # Scaled so U @ V has variance ~1/in_features, matching nn.Linear default.
         std = (1.0 / in_features) ** 0.5
         self.U = nn.Parameter(torch.randn(out_features, rank) * (std ** 0.5))
         self.V = nn.Parameter(torch.randn(rank, in_features) * (std ** 0.5))
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.linear(x, (self.U @ self.V).to(x.dtype))
+        U = _fake_quantize(self.U) if self.training else self.U
+        V = _fake_quantize(self.V) if self.training else self.V
+        return F.linear(x, (U @ V).to(x.dtype))
 
     def param_count_summary(self) -> dict[str, int]:
         uv = self.U.numel() + self.V.numel()
@@ -1136,6 +1148,11 @@ def main() -> None:
         log0(f"factorized_attn:enabled k_rank={args.attn_k_rank} v_rank={args.attn_v_rank} proj_rank={args.attn_proj_rank}")
     else:
         log0("factorized_attn:disabled")
+    global _QAT_BITS
+    if args.use_qat:
+        _QAT_BITS = args.qat_bits if args.qat_bits > 0 else args.quant_bits
+        log0(f"qat:enabled bits={_QAT_BITS}")
+
     if args.use_moe:
         torch._dynamo.config.capture_scalar_outputs = True
         compiled_model = torch.compile(base_model, dynamic=True)
@@ -1419,7 +1436,7 @@ def main() -> None:
             log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
         qbits = args.quant_bits
-        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=qbits)
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), bits=qbits, fp16_embed=args.fp16_embed)
         quant_buf = io.BytesIO()
         torch.save(quant_obj, quant_buf)
         quant_raw = quant_buf.getvalue()
