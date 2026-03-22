@@ -13,9 +13,11 @@ NGPU=${NGPU:-1}
 if [ "$NGPU" -gt 1 ]; then
     LAUNCHER="torchrun --nproc_per_node=$NGPU"
     BATCH=786432
+    ACCUM=2
 else
     LAUNCHER="python3"
     BATCH=98304
+    ACCUM=1
 fi
 
 env \
@@ -45,7 +47,7 @@ env \
     \
     TRAIN_SEQ_LEN=2048 \
     TRAIN_BATCH_TOKENS=$BATCH \
-    GRAD_ACCUM_STEPS=1 \
+    GRAD_ACCUM_STEPS=$ACCUM \
     ITERATIONS=${LOMOE_ITERATIONS:-7500} \
     MAX_WALLCLOCK_SECONDS=${LOMOE_WALLCLOCK:-600} \
     WARMUP_STEPS=20 \
