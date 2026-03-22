@@ -2,11 +2,21 @@
 set -euo pipefail
 cd /workspace/parameter-golf
 
-# Ensure zstd compression is available
 pip install -q pyzstd 2>/dev/null || true
 
 SCRIPT=records/track_10min_16mb/2026-03-22_LoMoE/train_gpt.py
 RUN_ID=${1:-factorized_moe}
+
+# Auto-detect GPUs: 1 GPU uses python3 + small batch, multi-GPU uses torchrun + full batch.
+NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
+NGPU=${NGPU:-1}
+if [ "$NGPU" -gt 1 ]; then
+    LAUNCHER="torchrun --nproc_per_node=$NGPU"
+    BATCH=786432
+else
+    LAUNCHER="python3"
+    BATCH=98304
+fi
 
 env \
     RUN_ID=$RUN_ID \
@@ -34,7 +44,7 @@ env \
     MOE_AUX_LOSS_COEFF=0.01 \
     \
     TRAIN_SEQ_LEN=2048 \
-    TRAIN_BATCH_TOKENS=98304 \
+    TRAIN_BATCH_TOKENS=$BATCH \
     GRAD_ACCUM_STEPS=1 \
     ITERATIONS=${LOMOE_ITERATIONS:-7500} \
     MAX_WALLCLOCK_SECONDS=${LOMOE_WALLCLOCK:-600} \
@@ -65,4 +75,4 @@ env \
     USE_ZSTD=1 \
     ZSTD_LEVEL=22 \
     \
-    python3 "$SCRIPT"
+    $LAUNCHER "$SCRIPT"
