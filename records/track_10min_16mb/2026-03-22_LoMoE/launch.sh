@@ -35,6 +35,11 @@ print(json.dumps(s, indent=2))
         nohup bash "$DIR/run_dense.sh" lomoe_dense > $LOGS/lomoe.out 2>&1 &
         echo "PID: $! — dense factorized, 10 min cap. bash launch.sh log to watch"
         ;;
+    extended)
+        LOMOE_ITERATIONS=15000 LOMOE_WALLCLOCK=0 \
+        nohup bash "$DIR/run.sh" lomoe > $LOGS/lomoe.out 2>&1 &
+        echo "PID: $! — MoE extended, 15000 steps (~60 min). bash launch.sh log to watch"
+        ;;
     long)
         LOMOE_ITERATIONS=7500 LOMOE_WALLCLOCK=0 \
         nohup bash "$DIR/run.sh" lomoe > $LOGS/lomoe.out 2>&1 &
