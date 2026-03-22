@@ -2,27 +2,29 @@
 
 ## Score: val_bpb = TBD
 
-8xH100, 600s training. ~15MB artifact (int8+zstd-22).
+8xH100 SXM, 600s training. Artifact under 16MB.
 
 ## Method
 
-LoMoE replaces each transformer layer's MLP with a mixture of 8
-low-rank experts (top-2 routing). Expert weights are parameterized
-as W=UV (rank-64), reducing per-expert storage. At submission time,
-U and V are quantized to int8 per-row and compressed with zstd-22.
-This stacks two orthogonal compression axes: rank reduction and
-quantization.
+Each transformer layer uses 8 factorized experts (top-2 routing)
+instead of a single MLP. Expert weights are parameterized as W=UV
+(rank-64). At submission time, expert U/V matrices are quantized
+to int6 per-row, attention weights to int8, and tied embeddings
+are kept in fp16. Compressed with zstd-22.
 
-Sparse bmm dispatch sorts tokens by expert assignment, pads each
-expert's batch, and runs 4 torch.bmm calls over all experts in
-parallel. Only routed tokens are computed (2/8 per token).
+Quantization-aware training (QAT) fake-quantizes weights during
+the forward pass using a straight-through estimator. The model
+learns values that fall on quantization grid points, reducing
+post-training quantization penalty.
+
+Sparse bmm dispatch sorts tokens by expert assignment and runs
+4 batched matmuls over all experts. Only routed tokens are
+computed (2 of 8 per token).
 
 Attention uses dense Q with factorized K (rank-16), V (rank-16),
-and output projection (rank-32).
-
-BigramHash embedding (4096 buckets) provides token-pair context.
-SmearGate blends adjacent token embeddings via a learned gate.
-Orthogonal weight initialization for 2D matrices.
+and output projection (rank-32). BigramHash embedding (4096
+buckets) and SmearGate provide token-pair context. Orthogonal
+weight initialization.
 
 ## Config
 
@@ -30,6 +32,7 @@ Orthogonal weight initialization for 2D matrices.
 |-----------|-------|
 | num_layers | 8 |
 | model_dim | 512 |
+| num_heads / num_kv_heads | 8 / 4 |
 | mlp_mult | 3 |
 | moe_num_experts | 8 |
 | moe_top_k | 2 |
@@ -42,11 +45,15 @@ Orthogonal weight initialization for 2D matrices.
 | warmdown_iters | 3000 |
 | swa_start_frac | 0.75 |
 | swa_every | 100 |
-| quant | int8 per-row + zstd-22 |
+| qat_bits | 6 |
+| quant (experts) | int6 per-row |
+| quant (attention) | int8 per-row |
+| quant (embeddings) | fp16 |
+| compression | zstd-22 |
 
 ## Training
 
-Muon optimizer for matrix params, AdamW for embeddings/scalars.
-Momentum warmup 0.92->0.99 over 1500 steps. SWA every 100 steps
-over the last 25% of training. BigramHash + SmearGate + OrthoInit
-enabled. Sparse bmm MoE dispatch at ~325ms/step on 1xH100.
+Muon optimizer for 2D matrix params. AdamW for embeddings and
+scalars. Muon momentum warmup 0.92 to 0.99 over 1500 steps.
+SWA every 100 steps over the last 25% of training. Trained at
+seq_len=2048, batch=786432.
