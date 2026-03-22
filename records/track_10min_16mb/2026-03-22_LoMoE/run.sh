@@ -3,6 +3,7 @@ set -euo pipefail
 cd /workspace/parameter-golf
 
 pip install -q pyzstd 2>/dev/null || true
+export PYTHONWARNINGS="ignore::UserWarning"
 
 SCRIPT=records/track_10min_16mb/2026-03-22_LoMoE/train_gpt.py
 RUN_ID=${1:-factorized_moe}
