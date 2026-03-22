@@ -422,7 +422,9 @@ def quantize_state_dict_int8(state_dict: dict[str, Tensor], bits: int = 8, fp16_
             continue
 
         stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor(t, bits=bits)
+        # Mixed quant: expert MLP weights get lower bits, attention gets full bits.
+        tbits = 6 if ("experts" in name and bits > 6) else bits
+        q, s = quantize_float_tensor(t, bits=tbits)
         if s.ndim > 0:
             qmeta[name] = {"scheme": "per_row", "axis": 0}
         quantized[name] = q

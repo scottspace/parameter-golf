@@ -59,6 +59,7 @@ env \
     SWA_EVERY=100 \
     \
     USE_QAT=1 \
+    QAT_BITS=6 \
     FP16_EMBED=1 \
     QUANT_BITS=8 \
     USE_ZSTD=1 \
