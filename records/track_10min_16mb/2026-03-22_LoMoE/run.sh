@@ -14,7 +14,7 @@ NGPU=${NGPU:-1}
 if [ "$NGPU" -gt 1 ]; then
     LAUNCHER="torchrun --nproc_per_node=$NGPU"
     BATCH=786432
-    ACCUM=2
+    ACCUM=1
 else
     LAUNCHER="python3"
     BATCH=98304
