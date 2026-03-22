@@ -755,9 +755,10 @@ class MoEMLP(nn.Module):
         x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
         N, D = x_flat.shape
         E = self.num_experts
+        K = self.top_k
 
         logits = self.router(x_flat)  # (N, E)
-        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=-1)  # (N, K)
+        top_k_logits, top_k_indices = logits.topk(K, dim=-1)  # (N, K)
         top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, K)
 
         # Load balancing auxiliary loss
@@ -765,11 +766,41 @@ class MoEMLP(nn.Module):
         one_hot = F.one_hot(top_k_indices, E).sum(dim=1).float()
         self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * E
 
-        # Compute all experts, gather top-K, blend. No sort, no .item(), no graph breaks.
-        expert_outputs = torch.stack([e(x_flat) for e in self.experts], dim=1)  # (N, E, D)
-        idx = top_k_indices.unsqueeze(-1).expand(-1, -1, D)  # (N, K, D)
-        selected = expert_outputs.gather(1, idx)  # (N, K, D)
-        output = (selected * top_k_weights.unsqueeze(-1)).sum(dim=1)  # (N, D)
+        # Sparse bmm: sort tokens by expert, pad, 4 batched matmuls on small tensors.
+        flat_ids = top_k_indices.reshape(-1)  # (N*K,)
+        flat_w = top_k_weights.reshape(-1, 1)  # (N*K, 1)
+        flat_x = x_flat.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)  # (N*K, D)
+
+        order = flat_ids.argsort(stable=True)
+        sorted_x = flat_x[order]
+        sorted_ids = flat_ids[order]
+
+        # Expert boundaries and padding
+        counts = torch.zeros(E + 1, dtype=torch.long, device=x.device)
+        counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
+        offsets = counts.cumsum(0)
+        max_ct = counts[1:].max().item()
+
+        # Position of each token within its expert group (vectorized, no loop)
+        pos = torch.arange(N * K, device=x.device) - offsets[sorted_ids]
+
+        # Pad into (E, max_ct, D) — only routed tokens, not all N
+        x_pad = sorted_x.new_zeros(E, max_ct, D)
+        x_pad[sorted_ids, pos] = sorted_x
+
+        # Stack expert U/V weights and run 4 bmm calls
+        dt = x_pad.dtype
+        V_fc = torch.stack([e.fc.V.to(dt) for e in self.experts])
+        U_fc = torch.stack([e.fc.U.to(dt) for e in self.experts])
+        V_pj = torch.stack([e.proj.V.to(dt) for e in self.experts])
+        U_pj = torch.stack([e.proj.U.to(dt) for e in self.experts])
+        h = torch.bmm(torch.bmm(x_pad, V_fc.transpose(1, 2)), U_fc.transpose(1, 2))
+        h = torch.relu(h).square()
+        h = torch.bmm(torch.bmm(h, V_pj.transpose(1, 2)), U_pj.transpose(1, 2))
+
+        # Unpad, weight, unsort, sum K contributions per token
+        sorted_out = h[sorted_ids, pos] * flat_w[order]
+        output = sorted_out[order.argsort()].reshape(N, K, D).sum(dim=1)
         return output.reshape(orig_shape)
 
 
@@ -1105,7 +1136,11 @@ def main() -> None:
         log0(f"factorized_attn:enabled k_rank={args.attn_k_rank} v_rank={args.attn_v_rank} proj_rank={args.attn_proj_rank}")
     else:
         log0("factorized_attn:disabled")
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    if args.use_moe:
+        torch._dynamo.config.capture_scalar_outputs = True
+        compiled_model = torch.compile(base_model, dynamic=True)
+    else:
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
