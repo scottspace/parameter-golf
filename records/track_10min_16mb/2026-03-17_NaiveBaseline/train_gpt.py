@@ -1153,7 +1153,9 @@ def main() -> None:
         _QAT_BITS = args.qat_bits if args.qat_bits > 0 else args.quant_bits
         log0(f"qat:enabled bits={_QAT_BITS}")
 
-    if args.use_moe:
+    if args.use_moe and distributed:
+        compiled_model = base_model  # MoE sparse dispatch breaks torch.compile + DDP
+    elif args.use_moe:
         torch._dynamo.config.capture_scalar_outputs = True
         compiled_model = torch.compile(base_model, dynamic=True)
     else:
