@@ -7,6 +7,12 @@ case "${1:-run}" in
     kill)  pkill -f "train_gpt.py" && echo "Killed." || echo "Nothing running." ;;
     log)   tail -f $LOGS/lomoe.out ;;
     sweep) python3 "$DIR/sweep_compression.py" "${2:-$LOGS/lomoe_model.pt}" --eval ;;
+    save)
+        cp $LOGS/lomoe.out "$DIR/train_seed1337.log" 2>/dev/null && echo "Copied training log"
+        cp $LOGS/lomoe_config.json "$DIR/" 2>/dev/null && echo "Copied config"
+        cp $LOGS/lomoe_model.int*.ptz "$DIR/" 2>/dev/null && echo "Copied artifact"
+        echo "Ready to commit and push."
+        ;;
     long)
         LOMOE_ITERATIONS=7500 LOMOE_WALLCLOCK=0 \
         nohup bash "$DIR/run.sh" lomoe > $LOGS/lomoe.out 2>&1 &
