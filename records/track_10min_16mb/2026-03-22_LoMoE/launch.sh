@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 DIR=$(cd "$(dirname "$0")" && pwd)
 LOGS=/workspace/parameter-golf/logs
+mkdir -p "$LOGS"
 
 case "${1:-run}" in
     kill)  pkill -f "train_gpt.py" && echo "Killed." || echo "Nothing running." ;;
