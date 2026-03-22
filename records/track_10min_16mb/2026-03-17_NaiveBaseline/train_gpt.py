@@ -761,58 +761,51 @@ class MoEMLP(nn.Module):
             for _ in range(num_experts)
         ])
         self.aux_loss = torch.tensor(0.0)
+        self.sparse_dispatch = True  # set False for DDP+compile compatibility
 
     def forward(self, x: Tensor) -> Tensor:
         orig_shape = x.shape
-        x_flat = x.reshape(-1, x.shape[-1])  # (N, D)
+        x_flat = x.reshape(-1, x.shape[-1])
         N, D = x_flat.shape
         E = self.num_experts
         K = self.top_k
 
-        logits = self.router(x_flat)  # (N, E)
-        top_k_logits, top_k_indices = logits.topk(K, dim=-1)  # (N, K)
-        top_k_weights = F.softmax(top_k_logits, dim=-1)  # (N, K)
+        logits = self.router(x_flat)
+        top_k_logits, top_k_indices = logits.topk(K, dim=-1)
+        top_k_weights = F.softmax(top_k_logits, dim=-1)
 
-        # Load balancing auxiliary loss
         probs = F.softmax(logits, dim=-1)
         one_hot = F.one_hot(top_k_indices, E).sum(dim=1).float()
         self.aux_loss = (probs.mean(0) * one_hot.mean(0)).sum() * E
 
-        # Sparse bmm: sort tokens by expert, pad, 4 batched matmuls on small tensors.
-        flat_ids = top_k_indices.reshape(-1)  # (N*K,)
-        flat_w = top_k_weights.reshape(-1, 1)  # (N*K, 1)
-        flat_x = x_flat.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)  # (N*K, D)
-
-        order = flat_ids.argsort(stable=True)
-        sorted_x = flat_x[order]
-        sorted_ids = flat_ids[order]
-
-        # Expert boundaries and padding
-        counts = torch.zeros(E + 1, dtype=torch.long, device=x.device)
-        counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
-        offsets = counts.cumsum(0)
-        max_ct = counts[1:].max().item()
-
-        # Position of each token within its expert group (vectorized, no loop)
-        pos = torch.arange(N * K, device=x.device) - offsets[sorted_ids]
-
-        # Pad into (E, max_ct, D) — only routed tokens, not all N
-        x_pad = sorted_x.new_zeros(E, max_ct, D)
-        x_pad[sorted_ids, pos] = sorted_x
-
-        # Stack expert U/V weights and run 4 bmm calls
-        dt = x_pad.dtype
-        V_fc = torch.stack([e.fc.V.to(dt) for e in self.experts])
-        U_fc = torch.stack([e.fc.U.to(dt) for e in self.experts])
-        V_pj = torch.stack([e.proj.V.to(dt) for e in self.experts])
-        U_pj = torch.stack([e.proj.U.to(dt) for e in self.experts])
-        h = torch.bmm(torch.bmm(x_pad, V_fc.transpose(1, 2)), U_fc.transpose(1, 2))
-        h = torch.relu(h).square()
-        h = torch.bmm(torch.bmm(h, V_pj.transpose(1, 2)), U_pj.transpose(1, 2))
-
-        # Unpad, weight, unsort, sum K contributions per token
-        sorted_out = h[sorted_ids, pos] * flat_w[order]
-        output = sorted_out[order.argsort()].reshape(N, K, D).sum(dim=1)
+        if self.sparse_dispatch:
+            flat_ids = top_k_indices.reshape(-1)
+            flat_w = top_k_weights.reshape(-1, 1)
+            flat_x = x_flat.unsqueeze(1).expand(-1, K, -1).reshape(-1, D)
+            order = flat_ids.argsort(stable=True)
+            sorted_x, sorted_ids = flat_x[order], flat_ids[order]
+            counts = torch.zeros(E + 1, dtype=torch.long, device=x.device)
+            counts.scatter_add_(0, sorted_ids + 1, torch.ones_like(sorted_ids))
+            offsets = counts.cumsum(0)
+            max_ct = counts[1:].max().item()
+            pos = torch.arange(N * K, device=x.device) - offsets[sorted_ids]
+            x_pad = sorted_x.new_zeros(E, max_ct, D)
+            x_pad[sorted_ids, pos] = sorted_x
+            dt = x_pad.dtype
+            V_fc = torch.stack([e.fc.V.to(dt) for e in self.experts])
+            U_fc = torch.stack([e.fc.U.to(dt) for e in self.experts])
+            V_pj = torch.stack([e.proj.V.to(dt) for e in self.experts])
+            U_pj = torch.stack([e.proj.U.to(dt) for e in self.experts])
+            h = torch.bmm(torch.bmm(x_pad, V_fc.transpose(1, 2)), U_fc.transpose(1, 2))
+            h = torch.relu(h).square()
+            h = torch.bmm(torch.bmm(h, V_pj.transpose(1, 2)), U_pj.transpose(1, 2))
+            sorted_out = h[sorted_ids, pos] * flat_w[order]
+            output = sorted_out[order.argsort()].reshape(N, K, D).sum(dim=1)
+        else:
+            expert_outputs = torch.stack([e(x_flat) for e in self.experts], dim=1)
+            idx = top_k_indices.unsqueeze(-1).expand(-1, -1, D)
+            selected = expert_outputs.gather(1, idx)
+            output = (selected * top_k_weights.unsqueeze(-1)).sum(dim=1)
         return output.reshape(orig_shape)
 
 
@@ -1154,7 +1147,9 @@ def main() -> None:
         log0(f"qat:enabled bits={_QAT_BITS}")
 
     if args.use_moe and distributed:
-        compiled_model = base_model  # MoE sparse dispatch breaks torch.compile + DDP
+        for b in base_model.blocks:
+            if hasattr(b.mlp, 'sparse_dispatch'): b.mlp.sparse_dispatch = False
+        compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     elif args.use_moe:
         torch._dynamo.config.capture_scalar_outputs = True
         compiled_model = torch.compile(base_model, dynamic=True)
