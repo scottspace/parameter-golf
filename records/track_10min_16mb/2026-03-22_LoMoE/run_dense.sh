@@ -30,7 +30,7 @@ env \
     MLP_MULT=3 \
     \
     USE_FACTOR_MLP=1 \
-    MLP_LOW_RANK_R=64 \
+    MLP_LOW_RANK_R=192 \
     USE_FACTOR_ATTN=1 \
     ATTN_K_RANK=16 \
     ATTN_V_RANK=16 \
