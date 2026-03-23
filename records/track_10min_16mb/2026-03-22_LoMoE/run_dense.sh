@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Best-shot dense factorized run: high rank, 12 layers, SOTA-matched LRs.
+# Factorized W=UV compresses 44% better than dense — fits ~25M params in 16MB.
+# Forward compute is identical to dense (U@V materialized before matmul).
 set -euo pipefail
 cd /workspace/parameter-golf
 
@@ -23,18 +26,18 @@ env \
     TOKENIZER_PATH=./data/tokenizers/fineweb_1024_bpe.model \
     VOCAB_SIZE=1024 \
     \
-    NUM_LAYERS=10 \
+    NUM_LAYERS=12 \
     MODEL_DIM=512 \
     NUM_HEADS=8 \
     NUM_KV_HEADS=4 \
     MLP_MULT=3 \
     \
     USE_FACTOR_MLP=1 \
-    MLP_LOW_RANK_R=192 \
+    MLP_LOW_RANK_R=256 \
     USE_FACTOR_ATTN=1 \
-    ATTN_K_RANK=16 \
-    ATTN_V_RANK=16 \
-    ATTN_PROJ_RANK=32 \
+    ATTN_K_RANK=32 \
+    ATTN_V_RANK=32 \
+    ATTN_PROJ_RANK=64 \
     \
     TRAIN_SEQ_LEN=2048 \
     TRAIN_BATCH_TOKENS=786432 \
@@ -43,10 +46,13 @@ env \
     WARMUP_STEPS=20 \
     WARMDOWN_ITERS=3000 \
     TRAIN_LOG_EVERY=100 \
+    VAL_LOSS_EVERY=1000 \
     \
     WEIGHT_DECAY=0.04 \
-    GRAD_CLIP_NORM=0.1 \
+    GRAD_CLIP_NORM=0.3 \
     MATRIX_LR=0.02 \
+    SCALAR_LR=0.02 \
+    TIED_EMBED_LR=0.03 \
     MUON_MOMENTUM=0.99 \
     MUON_MOMENTUM_WARMUP_START=0.92 \
     MUON_MOMENTUM_WARMUP_STEPS=1500 \
@@ -63,7 +69,7 @@ env \
     USE_QAT=1 \
     QAT_BITS=6 \
     FP16_EMBED=1 \
-    QUANT_BITS=8 \
+    QUANT_BITS=6 \
     USE_ZSTD=1 \
     ZSTD_LEVEL=22 \
     \
